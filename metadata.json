@@ -1,0 +1,6 @@
+{
+  "name": "pumanocan",
+  "description": "Store Once. Access Everywhere. A premium, high-fidelity secure cloud storage vault inspired by Apple VisionOS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

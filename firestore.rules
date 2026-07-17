@@ -1,0 +1,104 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    
+    function incoming() {
+      return request.resource.data;
+    }
+    
+    function existing() {
+      return resource.data;
+    }
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // 1. Profiles Rules
+    function isValidProfile(data) {
+      return data.id is string && data.id.size() <= 128
+        && data.email is string && data.email.size() <= 256
+        && data.display_name is string && data.display_name.size() <= 128
+        && data.vault_name is string && data.vault_name.size() <= 128
+        && data.created_at is string;
+    }
+
+    match /profiles/{profileId} {
+      allow read: if true;
+      allow create: if isValidId(profileId) && isValidProfile(incoming());
+      allow update: if isValidId(profileId) && isValidProfile(incoming());
+      allow delete: if false;
+    }
+
+    // 2. Folders Rules
+    function isValidFolder(data) {
+      return data.id is string && data.id.size() <= 128
+        && data.owner_id is string && data.owner_id.size() <= 128
+        && data.folder_name is string && data.folder_name.size() <= 128
+        && (data.parent_id == null || (data.parent_id is string && data.parent_id.size() <= 128))
+        && data.created_at is string;
+    }
+
+    match /folders/{folderId} {
+      allow read: if true;
+      allow create: if isValidId(folderId) && isValidFolder(incoming());
+      allow update: if isValidId(folderId) && isValidFolder(incoming()) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['folder_name', 'is_pinned', 'is_favorite'])
+      );
+      allow delete: if true;
+    }
+
+    // 3. Files Rules
+    function isValidFile(data) {
+      return data.id is string && data.id.size() <= 128
+        && data.owner_id is string && data.owner_id.size() <= 128
+        && (data.folder_id == null || (data.folder_id is string && data.folder_id.size() <= 128))
+        && data.filename is string && data.filename.size() <= 256
+        && data.file_url is string && data.file_url.size() <= 2048
+        && data.file_size is int
+        && data.mime_type is string && data.mime_type.size() <= 128
+        && data.created_at is string
+        && data.updated_at is string
+        && data.download_count is int
+        && (!('is_seeded' in data) || data.is_seeded is bool)
+        && (!('is_pinned' in data) || data.is_pinned is bool)
+        && (!('is_favorite' in data) || data.is_favorite is bool)
+        && (!('is_deleted' in data) || data.is_deleted is bool);
+    }
+
+    match /files/{fileId} {
+      allow read: if true;
+      allow create: if isValidId(fileId) && isValidFile(incoming());
+      allow update: if isValidId(fileId) && isValidFile(incoming()) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['filename', 'is_pinned', 'is_favorite', 'is_deleted', 'folder_id', 'download_count', 'updated_at', 'is_seeded'])
+      );
+      allow delete: if true;
+    }
+
+    // 4. Activities Rules
+    function isValidActivity(data) {
+      return data.id is string && data.id.size() <= 128
+        && data.owner_id is string && data.owner_id.size() <= 128
+        && data.type is string && data.type.size() <= 64
+        && data.details is string && data.details.size() <= 1024
+        && data.timestamp is string;
+    }
+
+    match /activities/{activityId} {
+      allow read: if true;
+      allow create: if isValidId(activityId) && isValidActivity(incoming());
+      allow update: if false;
+      allow delete: if false;
+    }
+  }
+}

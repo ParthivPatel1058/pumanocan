@@ -1,0 +1,86 @@
+{
+  "entities": {
+    "Profile": {
+      "title": "Profile",
+      "description": "User profile with vault-specific security settings",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "email": { "type": "string" },
+        "display_name": { "type": "string" },
+        "vault_name": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "passcode": { "type": "string" },
+        "biometrics_enabled": { "type": "boolean" }
+      },
+      "required": ["id", "email", "display_name", "vault_name", "created_at"]
+    },
+    "Folder": {
+      "title": "Folder",
+      "description": "Folders created by the user inside their private vault",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "owner_id": { "type": "string" },
+        "folder_name": { "type": "string" },
+        "parent_id": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "is_pinned": { "type": "boolean" },
+        "is_favorite": { "type": "boolean" }
+      },
+      "required": ["id", "owner_id", "folder_name", "created_at"]
+    },
+    "FileItem": {
+      "title": "FileItem",
+      "description": "Metadata for presentation slides and documents uploaded to the vault",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "owner_id": { "type": "string" },
+        "folder_id": { "type": "string" },
+        "filename": { "type": "string" },
+        "file_url": { "type": "string" },
+        "file_size": { "type": "integer" },
+        "mime_type": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "is_pinned": { "type": "boolean" },
+        "is_favorite": { "type": "boolean" },
+        "is_deleted": { "type": "boolean" },
+        "download_count": { "type": "integer" }
+      },
+      "required": ["id", "owner_id", "filename", "file_url", "file_size", "mime_type", "created_at", "updated_at", "download_count"]
+    },
+    "ActivityLog": {
+      "title": "ActivityLog",
+      "description": "User operations logged for audit trails",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "owner_id": { "type": "string" },
+        "type": { "type": "string", "enum": ["upload", "download", "share", "favorite", "delete", "create_folder"] },
+        "details": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "owner_id", "type", "details", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/profiles/{profileId}": {
+      "schema": "Profile",
+      "description": "User profiles catalogued by profile ID"
+    },
+    "/folders/{folderId}": {
+      "schema": "Folder",
+      "description": "Private folders catalogued by folder ID"
+    },
+    "/files/{fileId}": {
+      "schema": "FileItem",
+      "description": "Encrypted presentations and files catalogued by file ID"
+    },
+    "/activities/{activityId}": {
+      "schema": "ActivityLog",
+      "description": "User system activities logged for audit"
+    }
+  }
+}
