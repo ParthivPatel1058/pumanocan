@@ -836,6 +836,51 @@ export const dbFiles = {
       });
     };
 
+    // Helper to upload to tmpfiles.org with progress tracking using XMLHttpRequest
+    const uploadToTmpfilesWithProgress = (
+      f: File | Blob, 
+      fname: string, 
+      progressCallback?: (progress: number) => void
+    ): Promise<string> => {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', 'https://tmpfiles.org/api/v1/upload', true);
+        
+        if (progressCallback) {
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) {
+              const percentComplete = Math.round((event.loaded / event.total) * 100);
+              progressCallback(percentComplete);
+            }
+          };
+        }
+        
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              const json = JSON.parse(xhr.responseText);
+              if (json.status === 'success' && json.data && json.data.url) {
+                const directUrl = json.data.url.replace('https://tmpfiles.org/', 'https://tmpfiles.org/dl/');
+                resolve(directUrl);
+              } else {
+                reject(new Error('Invalid response format from tmpfiles.org'));
+              }
+            } catch (e) {
+              reject(e);
+            }
+          } else {
+            reject(new Error(`Server returned status ${xhr.status}`));
+          }
+        };
+        
+        xhr.onerror = () => reject(new Error('Network error during tmpfiles fallback upload'));
+        
+        const formData = new FormData();
+        formData.append('file', f, fname);
+        xhr.send(formData);
+      });
+    };
+
     // Helper to upload to Supabase Storage with XMLHttpRequest for progress tracking
     const uploadToSupabaseWithProgress = (
       f: File | Blob,
@@ -915,7 +960,7 @@ export const dbFiles = {
           console.log("Supabase SDK upload succeeded. Public URL:", cloudUrl);
         }
       } catch (err: any) {
-        console.error("All Supabase upload attempts failed, falling back to other tiers:", err);
+        console.warn("All Supabase upload attempts failed, falling back to other tiers:", err);
       }
     }
 
@@ -960,13 +1005,20 @@ export const dbFiles = {
       }
     }
 
-    // Tier 3: Try file.io fallback
+    // Tier 3: Try file.io fallback & tmpfiles.org fallback
     if (!cloudUrl) {
       try {
+        console.log("Attempting file.io fallback upload...");
         cloudUrl = await uploadToFileIoWithProgress(file, resolvedFilename, onProgress);
         console.log("file.io fallback upload succeeded:", cloudUrl);
       } catch (fallbackErr) {
-        console.error("Cloud storage fallback failed as well, using local Object URL:", fallbackErr);
+        console.warn("file.io cloud storage fallback failed, trying tmpfiles.org fallback...");
+        try {
+          cloudUrl = await uploadToTmpfilesWithProgress(file, resolvedFilename, onProgress);
+          console.log("tmpfiles.org fallback upload succeeded:", cloudUrl);
+        } catch (tmpfilesErr) {
+          console.warn("All cloud storage fallback uploads failed, using local Object URL fallback:", tmpfilesErr);
+        }
       }
     }
 

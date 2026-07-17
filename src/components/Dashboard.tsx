@@ -3,7 +3,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import { 
   Cloud, Search, Bell, Plus, Download, MoreHorizontal, Pin, Star, Folder, 
   Trash2, FileText, Presentation, FileCode, Check, RefreshCw, Upload, FileUp, 
-  ChevronRight, Calendar, ArrowUpRight, PlusCircle, Bookmark, ExternalLink, HelpCircle
+  ChevronRight, Calendar, ArrowUpRight, PlusCircle, Bookmark, ExternalLink, HelpCircle,
+  AlertTriangle
 } from 'lucide-react';
 import { Profile, Folder as FolderType, FileItem, ActivityLog, AppSettings } from '../types';
 import { dbFiles, dbFolders, dbActivities } from '../lib/db';
@@ -63,10 +64,28 @@ export default function Dashboard({
   const usedPercent = Math.min(100, Math.round((usedBytes / totalLimitBytes) * 100));
   const usedGB = (usedBytes / (1024 * 1024 * 1024)).toFixed(1);
 
+  interface ToastItem {
+    id: string;
+    message: string;
+    type: 'success' | 'error' | 'info' | 'upload_completed';
+    fileName?: string;
+  }
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+
   // Show dynamic system notification banner
-  const triggerNotification = (msg: string) => {
+  const triggerNotification = (
+    msg: string,
+    type: 'success' | 'error' | 'info' | 'upload_completed' = 'success',
+    fileName?: string
+  ) => {
     setNotificationMsg(msg);
     setTimeout(() => setNotificationMsg(null), 3000);
+
+    const id = 'toast-' + Math.random().toString(36).substring(2, 9);
+    setToasts(prev => [...prev, { id, message: msg, type, fileName }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 4000);
   };
 
   // Drag and Drop files handlers
@@ -84,7 +103,7 @@ export default function Dashboard({
     file: File | Blob;
     name: string;
     progress: number;
-    status: 'idle' | 'preparing' | 'uploading' | 'processing' | 'generating' | 'completed' | 'failed';
+    status: 'idle' | 'preparing' | 'uploading' | 'processing' | 'generating' | 'refreshing' | 'completed' | 'failed';
     error?: string;
     speed?: string;
     remainingTime?: string;
@@ -94,13 +113,73 @@ export default function Dashboard({
   const [uploadQueue, setUploadQueue] = useState<UploadItem[]>([]);
 
   // Computed state for compatibility with standard progress displays
-  const activeUploads = uploadQueue.filter(q => q.status === 'uploading' || q.status === 'preparing' || q.status === 'processing' || q.status === 'generating');
+  const activeUploads = uploadQueue.filter(q => q.status === 'uploading' || q.status === 'preparing' || q.status === 'processing' || q.status === 'generating' || q.status === 'refreshing');
   const uploadProgress = activeUploads.length > 0 
     ? Math.round(activeUploads.reduce((sum, q) => sum + q.progress, 0) / activeUploads.length)
     : null;
   const uploadFileName = activeUploads.length > 0 
     ? activeUploads[0].name + (activeUploads.length > 1 ? ` (+${activeUploads.length - 1} more)` : '')
     : '';
+
+  // Advanced batch calculations
+  const totalQueueCount = uploadQueue.length;
+  const completedQueueCount = uploadQueue.filter(q => q.status === 'completed').length;
+  const failedQueueCount = uploadQueue.filter(q => q.status === 'failed').length;
+  
+  const isCurrentlyUploading = uploadQueue.some(q => 
+    q.status === 'preparing' || 
+    q.status === 'uploading' || 
+    q.status === 'processing' || 
+    q.status === 'generating' ||
+    q.status === 'refreshing'
+  );
+
+  const isUploadBatchFinished = totalQueueCount > 0 && (completedQueueCount + failedQueueCount === totalQueueCount);
+  const hasUploadFailures = failedQueueCount > 0;
+
+  const overallProgress = uploadQueue.length > 0 
+    ? Math.round(uploadQueue.reduce((sum, q) => sum + q.progress, 0) / uploadQueue.length)
+    : 0;
+
+  const totalQueueSize = uploadQueue.reduce((sum, q) => sum + q.file.size, 0);
+  const uploadedQueueSize = uploadQueue.reduce((sum, q) => sum + (q.progress / 100) * q.file.size, 0);
+
+  let currentWorkflowState: 'Idle' | 'Selecting File' | 'Preparing Upload' | 'Uploading' | 'Generating Preview' | 'Saving Metadata' | 'Refreshing Dashboard' | 'Completed' | 'Failed' = 'Idle';
+  if (uploadQueue.length === 0) {
+    currentWorkflowState = 'Idle';
+  } else if (isUploadBatchFinished) {
+    if (hasUploadFailures) {
+      currentWorkflowState = 'Failed';
+    } else {
+      currentWorkflowState = 'Completed';
+    }
+  } else {
+    const currentActiveItem = uploadQueue.find(q => q.status !== 'completed' && q.status !== 'failed');
+    if (currentActiveItem) {
+      if (currentActiveItem.status === 'preparing') {
+        currentWorkflowState = 'Preparing Upload';
+      } else if (currentActiveItem.status === 'uploading') {
+        currentWorkflowState = 'Uploading';
+      } else if (currentActiveItem.status === 'processing') {
+        currentWorkflowState = 'Saving Metadata';
+      } else if (currentActiveItem.status === 'generating') {
+        currentWorkflowState = 'Generating Preview';
+      } else if (currentActiveItem.status === 'refreshing') {
+        currentWorkflowState = 'Refreshing Dashboard';
+      }
+    }
+  }
+
+  // Auto-dismiss completed uploads after 2 seconds
+  useEffect(() => {
+    if (uploadQueue.length > 0 && isUploadBatchFinished && !hasUploadFailures) {
+      const timer = setTimeout(() => {
+        handleClearQueue();
+        refreshData();
+      }, 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [uploadQueue, isUploadBatchFinished, hasUploadFailures, refreshData]);
 
   // Folder Traversal dropping engine
   const traverseDirectoryEntry = async (entry: any, path: string = ''): Promise<File[]> => {
@@ -258,10 +337,14 @@ export default function Dashboard({
         // State 4: Generating Preview
         setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'generating' } : q));
         await new Promise(resolve => setTimeout(resolve, 800));
+
+        // State 4.5: Refreshing Dashboard
+        setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'refreshing' } : q));
+        await new Promise(resolve => setTimeout(resolve, 600));
         
         // State 5: Completed (success)
         setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'completed' } : q));
-        triggerNotification(`Uploaded ${item.name} successfully!`);
+        triggerNotification(`Uploaded ${item.name} successfully!`, 'upload_completed', item.name);
         refreshData();
       } catch (err: any) {
         console.error(`Upload failed for ${item.name}:`, err);
@@ -358,8 +441,11 @@ export default function Dashboard({
       setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'generating' } : q));
       await new Promise(resolve => setTimeout(resolve, 800));
 
+      setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'refreshing' } : q));
+      await new Promise(resolve => setTimeout(resolve, 600));
+
       setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'completed' } : q));
-      triggerNotification(`Uploaded ${item.name} successfully!`);
+      triggerNotification(`Uploaded ${item.name} successfully!`, 'upload_completed', item.name);
       refreshData();
     } catch (err: any) {
       console.error(`Retry upload failed for ${item.name}:`, err);
@@ -551,20 +637,70 @@ export default function Dashboard({
   return (
     <div className="flex-1 space-y-6 select-none relative pb-12 text-left">
       
-      {/* 1. Global Floating Toast Notification Banner */}
-      <AnimatePresence>
-        {notificationMsg && (
-          <motion.div 
-            initial={{ opacity: 0, y: -20, scale: 0.95 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -20, scale: 0.95 }}
-            className="fixed top-6 right-6 z-50 glass-panel p-4 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 text-slate-800 dark:text-white flex items-center gap-2.5 shadow-lg max-w-sm"
-          >
-            <Check className="w-4.5 h-4.5 text-emerald-500 shrink-0" />
-            <span className="text-xs font-semibold leading-tight">{notificationMsg}</span>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* 1. Global Floating Toast Notification Stack */}
+      <div className="fixed top-6 right-6 z-50 flex flex-col gap-3 pointer-events-none max-w-sm w-full">
+        <AnimatePresence>
+          {toasts.map((toast) => (
+            <motion.div
+              key={toast.id}
+              layout
+              initial={{ opacity: 0, y: -20, scale: 0.9, filter: "blur(4px)" }}
+              animate={{ opacity: 1, y: 0, scale: 1, filter: "blur(0px)" }}
+              exit={{ opacity: 0, y: -20, scale: 0.9, filter: "blur(2px)", transition: { duration: 0.2 } }}
+              className={`pointer-events-auto flex items-center gap-3.5 p-4 rounded-2xl border backdrop-blur-xl shadow-2xl relative overflow-hidden transition-all max-w-sm ${
+                toast.type === 'upload_completed' 
+                  ? 'bg-emerald-950/40 dark:bg-emerald-950/50 border-emerald-500/30 text-white' 
+                  : toast.type === 'error'
+                  ? 'bg-rose-950/40 dark:bg-rose-950/50 border-rose-500/30 text-white'
+                  : 'bg-slate-900/40 dark:bg-slate-950/50 border-white/10 text-white'
+              }`}
+            >
+              {/* Decorative ambient background glow */}
+              {toast.type === 'upload_completed' && (
+                <div className="absolute inset-0 bg-gradient-to-r from-emerald-500/10 to-teal-500/10 pointer-events-none" />
+              )}
+              
+              {/* Icon wrapper */}
+              {toast.type === 'upload_completed' ? (
+                <motion.div
+                  initial={{ scale: 0, rotate: -30 }}
+                  animate={{ scale: 1, rotate: 0 }}
+                  transition={{ type: "spring", stiffness: 350, damping: 14, delay: 0.05 }}
+                  className="w-9 h-9 rounded-full bg-emerald-500/20 flex items-center justify-center text-emerald-400 border border-emerald-500/30 shadow-[0_0_15px_rgba(16,185,129,0.2)] shrink-0"
+                >
+                  <Check className="w-5 h-5 stroke-[3]" />
+                </motion.div>
+              ) : toast.type === 'error' ? (
+                <div className="w-9 h-9 rounded-full bg-rose-500/20 flex items-center justify-center text-rose-400 border border-rose-500/30 shrink-0">
+                  <AlertTriangle className="w-5 h-5" />
+                </div>
+              ) : (
+                <div className="w-9 h-9 rounded-full bg-indigo-500/20 flex items-center justify-center text-indigo-400 border border-indigo-500/30 shrink-0">
+                  <Check className="w-5 h-5" />
+                </div>
+              )}
+
+              {/* Text Details */}
+              <div className="flex-1 min-w-0">
+                {toast.type === 'upload_completed' ? (
+                  <>
+                    <p className="text-[10px] font-black tracking-widest text-emerald-400 uppercase font-sans">
+                      Upload Completed
+                    </p>
+                    <p className="text-xs font-semibold text-slate-100 dark:text-slate-200 truncate mt-0.5">
+                      {toast.fileName || toast.message}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs font-bold text-slate-100 dark:text-slate-200 leading-snug">
+                    {toast.message}
+                  </p>
+                )}
+              </div>
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
 
       {/* 2. Top Header Action Row (Greeting + Search + Icons) */}
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
@@ -700,32 +836,120 @@ export default function Dashboard({
               />
 
               {/* Uploading progress overlay */}
-              {uploadProgress !== null ? (
-                <div className="space-y-4 w-full max-w-xs">
-                  <div className="w-12 h-12 rounded-full bg-indigo-500/10 flex items-center justify-center mx-auto text-indigo-500 animate-spin">
-                    <RefreshCw className="w-6 h-6" />
+              {uploadQueue.length > 0 ? (
+                <div className="space-y-5 w-full max-w-sm p-6 bg-white/5 dark:bg-slate-950/10 backdrop-blur-md rounded-2xl border border-white/10 shadow-lg relative overflow-hidden transition-all duration-300">
+                  
+                  {/* Status Icon */}
+                  <div className="flex justify-center">
+                    {currentWorkflowState === 'Completed' ? (
+                      <motion.div 
+                        initial={{ scale: 0, rotate: -45 }}
+                        animate={{ scale: 1, rotate: 0 }}
+                        transition={{ type: "spring", stiffness: 200, damping: 15 }}
+                        className="w-14 h-14 rounded-full bg-emerald-500/10 flex items-center justify-center text-emerald-500 border border-emerald-500/20 shadow-lg shadow-emerald-500/5"
+                      >
+                        <Check className="w-7 h-7 stroke-[3]" />
+                      </motion.div>
+                    ) : currentWorkflowState === 'Failed' ? (
+                      <div className="w-14 h-14 rounded-full bg-rose-500/10 flex items-center justify-center text-rose-500 border border-rose-500/20 shadow-lg shadow-rose-500/5">
+                        <AlertTriangle className="w-7 h-7" />
+                      </div>
+                    ) : (
+                      // Running / spinner state
+                      <div className="relative w-14 h-14 rounded-full bg-indigo-500/10 flex items-center justify-center text-indigo-500 border border-indigo-500/5 shadow-inner">
+                        <RefreshCw className="w-7 h-7 animate-spin" />
+                      </div>
+                    )}
                   </div>
-                  <div>
-                    <span className="text-xs font-bold dark:text-white block truncate mb-1">
-                      Uploading {uploadFileName}...
+
+                  {/* Status Texts */}
+                  <div className="space-y-1">
+                    <span className="text-sm font-extrabold dark:text-white block truncate px-2 text-center">
+                      {currentWorkflowState === 'Completed' ? (
+                        <span className="text-emerald-500 dark:text-emerald-400">Upload Completed Successfully</span>
+                      ) : currentWorkflowState === 'Failed' ? (
+                        <span className="text-rose-500 dark:text-rose-400">Upload Failed</span>
+                      ) : (
+                        `Uploading ${uploadFileName}`
+                      )}
                     </span>
-                    <span className="text-[10px] text-slate-400 font-mono">
-                      Encrypting & uploading securely ({uploadProgress}% done)
+                    
+                    <span className="text-xs text-slate-500 dark:text-slate-400 font-mono block text-center h-4">
+                      {currentWorkflowState === 'Preparing Upload' && "Allocating isolated secure sandbox..."}
+                      {currentWorkflowState === 'Uploading' && `Encrypting & uploading securely (${overallProgress}% done)`}
+                      {currentWorkflowState === 'Saving Metadata' && "Hashing metadata & securing file records..."}
+                      {currentWorkflowState === 'Generating Preview' && "Generating slideshow PDF & thumbnails..."}
+                      {currentWorkflowState === 'Refreshing Dashboard' && "Refreshing workspace dashboard views..."}
+                      {currentWorkflowState === 'Completed' && "Your files have been safely encrypted & synced."}
+                      {currentWorkflowState === 'Failed' && "Some files could not be uploaded safely."}
                     </span>
                   </div>
-                  <div className="w-full bg-slate-200/50 dark:bg-slate-900/30 h-1.5 rounded-full overflow-hidden border border-white/10 relative">
-                    <div 
-                      className="bg-gradient-to-r from-indigo-500 to-purple-500 h-full rounded-full transition-all duration-200"
-                      style={{ width: `${uploadProgress}%` }}
-                    />
+
+                  {/* Glassmorphism Progress Bar */}
+                  <div className="space-y-1.5 px-2">
+                    <div className="w-full bg-slate-200/50 dark:bg-slate-900/30 h-2 rounded-full overflow-hidden border border-white/10 relative">
+                      <div 
+                        className={`h-full rounded-full transition-all duration-300 ${
+                          currentWorkflowState === 'Completed' ? 'bg-gradient-to-r from-emerald-400 to-teal-500' :
+                          currentWorkflowState === 'Failed' ? 'bg-gradient-to-r from-rose-500 to-red-600' :
+                          'bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500'
+                        }`}
+                        style={{ width: `${overallProgress}%` }}
+                      />
+                    </div>
+                    
+                    {/* Size and speed information shown beneath the progress bar */}
+                    {currentWorkflowState === 'Uploading' && activeUploads.length > 0 && (
+                      <div className="flex justify-between text-[10px] text-slate-400 font-mono mt-1 px-1">
+                        <span>Speed: {activeUploads[0].speed || 'estimating...'}</span>
+                        <span>{formatSize(uploadedQueueSize)} of {formatSize(totalQueueSize)}</span>
+                      </div>
+                    )}
                   </div>
-                  <button
-                    type="button"
-                    onClick={handleClearQueue}
-                    className="px-4 py-1.5 rounded-full bg-white/10 hover:bg-white/20 text-[10px] font-bold text-slate-500 hover:text-slate-800 dark:hover:text-white transition-all cursor-pointer"
-                  >
-                    Clear queue
-                  </button>
+
+                  {/* Actions / Buttons */}
+                  <div className="flex justify-center gap-3 pt-1">
+                    {currentWorkflowState === 'Failed' ? (
+                      <>
+                        {uploadQueue.some(q => q.status === 'failed') && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const failedItem = uploadQueue.find(q => q.status === 'failed');
+                              if (failedItem) handleRetryUpload(failedItem.id);
+                            }}
+                            className="px-4 py-1.5 rounded-full bg-indigo-500 hover:bg-indigo-600 text-[11px] font-bold text-white transition-all cursor-pointer shadow-md"
+                          >
+                            Retry failed
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={handleClearQueue}
+                          className="px-4 py-1.5 rounded-full bg-slate-200 dark:bg-white/10 hover:bg-white/20 text-[11px] font-bold text-slate-600 dark:text-slate-300 transition-all cursor-pointer"
+                        >
+                          Clear queue
+                        </button>
+                      </>
+                    ) : currentWorkflowState === 'Completed' ? (
+                      <button
+                        type="button"
+                        onClick={handleClearQueue}
+                        className="px-5 py-1.5 rounded-full bg-emerald-500 hover:bg-emerald-600 text-[11px] font-bold text-white transition-all cursor-pointer shadow-md"
+                      >
+                        Dismiss
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={handleClearQueue}
+                        className="px-4 py-1.5 rounded-full bg-slate-100 dark:bg-white/10 hover:bg-slate-200 dark:hover:bg-white/20 text-[10px] font-bold text-slate-500 hover:text-slate-800 dark:hover:text-white transition-all cursor-pointer"
+                      >
+                        Cancel upload
+                      </button>
+                    )}
+                  </div>
+
                 </div>
               ) : (
                 <>
