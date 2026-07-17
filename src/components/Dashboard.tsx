@@ -41,10 +41,8 @@ export default function Dashboard({
 
   // File Upload states
   const [isDragging, setIsDragging] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
-  const [uploadFileName, setUploadFileName] = useState('');
-  const [uploadCancelled, setUploadCancelled] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   // Quick contextual note state
   const [noteTitle, setNoteTitle] = useState('');
@@ -81,38 +79,207 @@ export default function Dashboard({
     setIsDragging(false);
   };
 
-  const performUpload = async (htmlFiles: FileList) => {
+  interface UploadItem {
+    id: string;
+    file: File;
+    name: string;
+    progress: number;
+    status: 'uploading' | 'completed' | 'failed';
+    error?: string;
+  }
+  const [uploadQueue, setUploadQueue] = useState<UploadItem[]>([]);
+
+  // Computed state for compatibility with standard progress displays
+  const activeUploads = uploadQueue.filter(q => q.status === 'uploading');
+  const uploadProgress = activeUploads.length > 0 
+    ? Math.round(activeUploads.reduce((sum, q) => sum + q.progress, 0) / activeUploads.length)
+    : null;
+  const uploadFileName = activeUploads.length > 0 
+    ? activeUploads[0].name + (activeUploads.length > 1 ? ` (+${activeUploads.length - 1} more)` : '')
+    : '';
+
+  // Folder Traversal dropping engine
+  const traverseDirectoryEntry = async (entry: any, path: string = ''): Promise<File[]> => {
+    const filesArray: File[] = [];
+    if (entry.isFile) {
+      const file = await new Promise<File>((resolve, reject) => entry.file(resolve, reject));
+      const relativePath = path ? `${path}/${file.name}` : file.name;
+      Object.defineProperty(file, 'webkitRelativePath', {
+        value: relativePath,
+        writable: true,
+        enumerable: true,
+        configurable: true
+      });
+      filesArray.push(file);
+    } else if (entry.isDirectory) {
+      const dirReader = entry.createReader();
+      // Read all entries recursively
+      const readAllEntries = async (): Promise<any[]> => {
+        const results: any[] = [];
+        let readBatch = async (): Promise<any[]> => {
+          return new Promise((resolve, reject) => {
+            dirReader.readEntries(resolve, reject);
+          });
+        };
+        let batch = await readBatch();
+        while (batch.length > 0) {
+          results.push(...batch);
+          batch = await readBatch();
+        }
+        return results;
+      };
+      
+      try {
+        const entries = await readAllEntries();
+        for (const childEntry of entries) {
+          const childFiles = await traverseDirectoryEntry(childEntry, path ? `${path}/${entry.name}` : entry.name);
+          filesArray.push(...childFiles);
+        }
+      } catch (err) {
+        console.error("Error reading folder entries:", err);
+      }
+    }
+    return filesArray;
+  };
+
+  const performUpload = async (htmlFiles: FileList | File[]) => {
     if (!htmlFiles || htmlFiles.length === 0) return;
     
-    const fileToUpload = htmlFiles[0];
-    setUploadFileName(fileToUpload.name);
-    setUploadProgress(0);
-    setUploadCancelled(false);
-
-    try {
-      await dbFiles.uploadFileReal(
-        user.id,
-        fileToUpload,
-        fileToUpload.name,
-        activeFolderId,
-        (progress) => {
-          setUploadProgress(progress);
+    const filesArray = Array.from(htmlFiles);
+    
+    // Enqueue all files
+    const newItems: UploadItem[] = filesArray.map(file => ({
+      id: 'upload-' + Math.random().toString(36).substring(2, 9),
+      file,
+      name: file.name,
+      progress: 0,
+      status: 'uploading'
+    }));
+    
+    setUploadQueue(prev => [...prev, ...newItems]);
+    
+    // Process sequential uploads so they are handled cleanly
+    for (const item of newItems) {
+      try {
+        let targetFolderId = activeFolderId;
+        
+        // If file contains path segments from a folder upload
+        const path = item.file.webkitRelativePath || '';
+        if (path && path.includes('/')) {
+          const pathParts = path.split('/');
+          if (pathParts.length > 1) {
+            let parentId = activeFolderId || '';
+            // Create nested subfolders as needed
+            for (let i = 0; i < pathParts.length - 1; i++) {
+              const folderName = pathParts[i];
+              const existingFolder = folders.find(f => f.folder_name === folderName && f.owner_id === user.id && f.parent_id === parentId);
+              if (existingFolder) {
+                parentId = existingFolder.id;
+              } else {
+                const newFolder = await dbFolders.createFolder(user.id, folderName, parentId || undefined);
+                parentId = newFolder.id;
+              }
+            }
+            targetFolderId = parentId || null;
+          }
         }
-      );
-      triggerNotification(`Uploaded ${fileToUpload.name} to Cloud Storage successfully!`);
-      setUploadProgress(null);
-      refreshData();
-    } catch (err: any) {
-      console.error("Cloud storage upload failed:", err);
-      triggerNotification(`Upload failed: ${err?.message || err}`);
-      setUploadProgress(null);
+        
+        await dbFiles.uploadFileReal(
+          user.id,
+          item.file,
+          item.name,
+          targetFolderId,
+          (progress) => {
+            setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, progress } : q));
+          }
+        );
+        
+        setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'completed', progress: 100 } : q));
+        triggerNotification(`Uploaded ${item.name} successfully!`);
+        refreshData();
+      } catch (err: any) {
+        console.error(`Upload failed for ${item.name}:`, err);
+        setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'failed', error: err?.message || 'Upload failed' } : q));
+        triggerNotification(`Failed to upload ${item.name}`);
+      }
     }
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const handleRetryUpload = async (itemId: string) => {
+    const item = uploadQueue.find(q => q.id === itemId);
+    if (!item) return;
+    
+    setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'uploading', progress: 0, error: undefined } : q));
+    
+    try {
+      let targetFolderId = activeFolderId;
+      const path = item.file.webkitRelativePath || '';
+      if (path && path.includes('/')) {
+        const pathParts = path.split('/');
+        if (pathParts.length > 1) {
+          let parentId = activeFolderId || '';
+          for (let i = 0; i < pathParts.length - 1; i++) {
+            const folderName = pathParts[i];
+            const existingFolder = folders.find(f => f.folder_name === folderName && f.owner_id === user.id && f.parent_id === parentId);
+            if (existingFolder) {
+              parentId = existingFolder.id;
+            } else {
+              const newFolder = await dbFolders.createFolder(user.id, folderName, parentId || undefined);
+              parentId = newFolder.id;
+            }
+          }
+          targetFolderId = parentId || null;
+        }
+      }
+
+      await dbFiles.uploadFileReal(
+        user.id,
+        item.file,
+        item.name,
+        targetFolderId,
+        (progress) => {
+          setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, progress } : q));
+        }
+      );
+      
+      setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'completed', progress: 100 } : q));
+      triggerNotification(`Uploaded ${item.name} successfully!`);
+      refreshData();
+    } catch (err: any) {
+      console.error(`Retry upload failed for ${item.name}:`, err);
+      setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'failed', error: err?.message || 'Upload failed' } : q));
+      triggerNotification(`Failed to upload ${item.name}`);
+    }
+  };
+
+  const handleClearQueue = () => {
+    setUploadQueue([]);
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+    
+    const items = e.dataTransfer.items;
+    if (items && items.length > 0) {
+      const allFiles: File[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === 'file') {
+          const entry = item.webkitGetAsEntry();
+          if (entry) {
+            const entryFiles = await traverseDirectoryEntry(entry);
+            allFiles.push(...entryFiles);
+          } else {
+            const file = item.getAsFile();
+            if (file) allFiles.push(file);
+          }
+        }
+      }
+      if (allFiles.length > 0) {
+        performUpload(allFiles);
+      }
+    } else if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       performUpload(e.dataTransfer.files);
     }
   };
@@ -406,6 +573,15 @@ export default function Dashboard({
                 className="hidden"
                 multiple
               />
+              <input
+                type="file"
+                ref={folderInputRef}
+                onChange={handleFileSelectChange}
+                className="hidden"
+                webkitdirectory=""
+                directory=""
+                multiple
+              />
 
               {/* Uploading progress overlay */}
               {uploadProgress !== null ? (
@@ -418,7 +594,7 @@ export default function Dashboard({
                       Uploading {uploadFileName}...
                     </span>
                     <span className="text-[10px] text-slate-400 font-mono">
-                      Encrypting & uploading securely ({uploadProgress}%)
+                      Encrypting & uploading securely ({uploadProgress}% done)
                     </span>
                   </div>
                   <div className="w-full bg-slate-200/50 dark:bg-slate-900/30 h-1.5 rounded-full overflow-hidden border border-white/10 relative">
@@ -429,13 +605,10 @@ export default function Dashboard({
                   </div>
                   <button
                     type="button"
-                    onClick={() => {
-                      setUploadProgress(null);
-                      triggerNotification("Upload cancelled by client.");
-                    }}
-                    className="px-4 py-1.5 rounded-full bg-white/10 hover:bg-white/20 text-[10px] font-bold text-slate-500 hover:text-slate-800 dark:hover:text-white transition-all"
+                    onClick={handleClearQueue}
+                    className="px-4 py-1.5 rounded-full bg-white/10 hover:bg-white/20 text-[10px] font-bold text-slate-500 hover:text-slate-800 dark:hover:text-white transition-all cursor-pointer"
                   >
-                    Cancel upload
+                    Clear queue
                   </button>
                 </div>
               ) : (
@@ -444,18 +617,29 @@ export default function Dashboard({
                     <FileUp className="w-7 h-7" />
                   </div>
                   <h3 className="text-sm font-bold text-slate-800 dark:text-white mb-1.5">
-                    Upload your presentation
+                    Upload your presentations
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mb-5 max-w-xs">
-                    Drag & drop your slideshows here or click browse files
+                    Drag & drop files or entire folders here, or browse below
                   </p>
-                  <button
-                    id="browse-files-btn"
-                    onClick={handleBrowseClick}
-                    className="px-6 py-2.5 rounded-full bg-white/25 dark:bg-slate-950/20 hover:bg-white/40 border border-white/45 text-indigo-700 dark:text-indigo-200 text-xs font-bold transition-all shadow cursor-pointer active:scale-95"
-                  >
-                    Browse Files
-                  </button>
+                  <div className="flex gap-3 flex-wrap justify-center">
+                    <button
+                      id="browse-files-btn"
+                      onClick={handleBrowseClick}
+                      className="px-5 py-2.5 rounded-full bg-white hover:bg-slate-50 text-indigo-700 dark:bg-slate-950 dark:hover:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs font-bold transition-all shadow cursor-pointer active:scale-95 flex items-center gap-1.5"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      Browse Files
+                    </button>
+                    <button
+                      id="browse-folders-btn"
+                      onClick={() => folderInputRef.current?.click()}
+                      className="px-5 py-2.5 rounded-full bg-indigo-50 hover:bg-indigo-600 text-white text-xs font-bold transition-all shadow cursor-pointer active:scale-95 flex items-center gap-1.5"
+                    >
+                      <Folder className="w-3.5 h-3.5" />
+                      Upload Folder
+                    </button>
+                  </div>
                 </>
               )}
             </div>
@@ -1177,6 +1361,76 @@ export default function Dashboard({
           refreshData={refreshData}
         />
       )}
+
+      {/* 11. FLOATING MULTI-FILE UPLOAD MANAGER WIDGET */}
+      <AnimatePresence>
+        {uploadQueue.length > 0 && (
+          <motion.div 
+            initial={{ opacity: 0, y: 50, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 50, scale: 0.9 }}
+            className="fixed bottom-6 right-6 z-40 bg-slate-900/90 dark:bg-slate-950/95 border border-white/10 text-white rounded-[24px] shadow-2xl w-80 p-4 max-h-96 flex flex-col overflow-hidden backdrop-blur-xl"
+          >
+            <div className="flex justify-between items-center pb-2.5 border-b border-white/10">
+              <div className="flex items-center gap-2">
+                <div className="w-2.5 h-2.5 rounded-full bg-indigo-500 animate-pulse" />
+                <span className="text-xs font-bold font-sans tracking-wide">
+                  Upload Manager ({uploadQueue.filter(q => q.status === 'completed').length}/{uploadQueue.length})
+                </span>
+              </div>
+              <button 
+                onClick={handleClearQueue}
+                className="text-[10px] text-slate-400 hover:text-white cursor-pointer transition-all"
+              >
+                Clear all
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto py-2 space-y-3 custom-scrollbar max-h-64 pr-1">
+              {uploadQueue.map((item) => (
+                <div key={item.id} className="space-y-1.5 p-2 rounded-xl bg-white/5 border border-white/5">
+                  <div className="flex justify-between items-center gap-2">
+                    <span className="text-[11px] font-semibold truncate max-w-[170px]" title={item.name}>
+                      {item.name}
+                    </span>
+                    <span className="text-[9px] font-mono shrink-0 uppercase tracking-wider">
+                      {item.status === 'uploading' && <span className="text-indigo-400 font-bold">{item.progress}%</span>}
+                      {item.status === 'completed' && <span className="text-emerald-400 font-bold">Done</span>}
+                      {item.status === 'failed' && <span className="text-rose-400 font-bold">Failed</span>}
+                    </span>
+                  </div>
+
+                  {/* Progress Line */}
+                  <div className="w-full bg-white/10 h-1 rounded-full overflow-hidden relative">
+                    <div 
+                      className={`h-full rounded-full transition-all duration-300 ${
+                        item.status === 'failed' ? 'bg-rose-500' :
+                        item.status === 'completed' ? 'bg-emerald-500' : 'bg-indigo-500'
+                      }`}
+                      style={{ width: `${item.progress}%` }}
+                    />
+                  </div>
+
+                  {/* Actions / Error Details */}
+                  {item.status === 'failed' && (
+                    <div className="flex justify-between items-center gap-2">
+                      <span className="text-[9px] text-rose-300 truncate max-w-[160px]">
+                        {item.error || 'Connection timeout'}
+                      </span>
+                      <button 
+                        onClick={() => handleRetryUpload(item.id)}
+                        className="text-[9px] font-bold text-indigo-400 hover:text-indigo-300 underline cursor-pointer"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
     </div>
   );

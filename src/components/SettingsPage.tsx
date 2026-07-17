@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
 import { 
-  Settings, Moon, Sun, Sliders, Palette, Globe, ShieldCheck, Fingerprint, Lock, KeyRound, Check, RefreshCw 
+  Settings, Moon, Sun, Sliders, Palette, Globe, ShieldCheck, Fingerprint, Lock, KeyRound, Check, RefreshCw, Database, Copy, ExternalLink, AlertCircle
 } from 'lucide-react';
 import { AppSettings, Profile } from '../types';
+import { getSupabaseConfig, saveSupabaseConfig, testSupabaseConnection, migrateAllToSupabase, getSupabaseDDL } from '../lib/supabase';
+import { dbFolders, dbFiles, dbActivities } from '../lib/db';
 
 interface SettingsPageProps {
   settings: AppSettings;
@@ -31,6 +33,64 @@ export default function SettingsPage({
   const [passcodeError, setPasscodeError] = useState('');
 
   const [biometricsEnabled, setBiometricsEnabled] = useState(user.biometrics_enabled ?? true);
+
+  // Supabase states
+  const initSupabase = getSupabaseConfig();
+  const [supabaseUrl, setSupabaseUrl] = useState(initSupabase.url);
+  const [supabaseAnonKey, setSupabaseAnonKey] = useState(initSupabase.anonKey);
+  const [supabaseEnabled, setSupabaseEnabled] = useState(initSupabase.enabled);
+  const [testingSupabase, setTestingSupabase] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  
+  const [syncingAll, setSyncingAll] = useState(false);
+  const [syncResult, setSyncResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [showDdl, setShowDdl] = useState(false);
+  const [copiedDdl, setCopiedDdl] = useState(false);
+
+  const handleTestSupabase = async () => {
+    setTestingSupabase(true);
+    setTestResult(null);
+    try {
+      const isConnected = await testSupabaseConnection(supabaseUrl, supabaseAnonKey);
+      if (isConnected) {
+        setTestResult({ success: true, message: 'Connected successfully to Supabase!' });
+      } else {
+        setTestResult({ success: false, message: 'Could not connect. Please verify your Supabase API URL and Anon Key.' });
+      }
+    } catch (err: any) {
+      setTestResult({ success: false, message: `Error: ${err.message || err}` });
+    } finally {
+      setTestingSupabase(false);
+    }
+  };
+
+  const handleSaveSupabase = () => {
+    saveSupabaseConfig(supabaseUrl, supabaseAnonKey, supabaseEnabled);
+    setTestResult({ success: true, message: 'Supabase configuration saved locally!' });
+  };
+
+  const handleSyncAllToSupabase = async () => {
+    setSyncingAll(true);
+    setSyncResult(null);
+    try {
+      const localFolders = dbFolders.getFolders(user.id);
+      const localFiles = dbFiles.getFiles(user.id);
+      const localLogs = dbActivities.getLogs(user.id);
+      
+      const res = await migrateAllToSupabase(user.id, localFolders, localFiles, localLogs, user);
+      setSyncResult(res);
+    } catch (err: any) {
+      setSyncResult({ success: false, message: `Sync failed: ${err.message || err}` });
+    } finally {
+      setSyncingAll(false);
+    }
+  };
+
+  const handleCopyDdl = () => {
+    navigator.clipboard.writeText(getSupabaseDDL());
+    setCopiedDdl(true);
+    setTimeout(() => setCopiedDdl(false), 2000);
+  };
 
   const backgrounds = [
     { name: 'Clouds ☁️', value: 'clouds', url: 'https://images.unsplash.com/photo-1517999144091-3d9dca6d1e43?auto=format&fit=crop&w=300&q=80' },
@@ -247,6 +307,146 @@ export default function SettingsPage({
             </div>
           </form>
 
+        </div>
+      </div>
+
+      {/* Supabase Integration Panel */}
+      <div className="glass-panel rounded-[32px] p-6 md:p-8 border border-white/45 shadow-xl space-y-6">
+        <div className="flex items-center gap-3 pb-3 border-b border-white/10">
+          <Database className="w-5 h-5 text-emerald-500" />
+          <h3 className="text-base font-bold text-slate-800 dark:text-white">Supabase Relational Database Sync</h3>
+        </div>
+
+        <p className="text-xs text-slate-500 dark:text-slate-300 leading-relaxed max-w-2xl">
+          Integrate a client-side Supabase connection to mirror and backup your files, folders, and activity logs instantly. 
+          Enjoy PostgreSQL performance with automated live-sync!
+        </p>
+
+        <div className="space-y-5 max-w-2xl">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+                Supabase API URL
+              </label>
+              <input
+                type="text"
+                placeholder="https://your-project.supabase.co"
+                value={supabaseUrl}
+                onChange={(e) => setSupabaseUrl(e.target.value)}
+                className="w-full bg-white/10 hover:bg-white/15 focus:bg-white/20 border border-white/20 rounded-xl px-4 py-2.5 text-xs text-slate-800 dark:text-white outline-none font-mono"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+                Supabase Anon Key
+              </label>
+              <input
+                type="password"
+                placeholder="your-supabase-anon-key"
+                value={supabaseAnonKey}
+                onChange={(e) => setSupabaseAnonKey(e.target.value)}
+                className="w-full bg-white/10 hover:bg-white/15 focus:bg-white/20 border border-white/20 rounded-xl px-4 py-2.5 text-xs text-slate-800 dark:text-white outline-none font-mono"
+              />
+            </div>
+          </div>
+
+          {/* Toggle Sync Switch */}
+          <div className="flex items-center justify-between p-4 rounded-2xl bg-white/5 border border-white/10">
+            <div className="space-y-0.5">
+              <span className="block text-xs font-bold text-slate-700 dark:text-white">Enable Real-Time Mirroring</span>
+              <span className="text-[10px] text-slate-400 dark:text-slate-300 block">
+                Automatically mirror all newly created presentation files, folders, and logs in Supabase.
+              </span>
+            </div>
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input
+                type="checkbox"
+                checked={supabaseEnabled}
+                onChange={(e) => setSupabaseEnabled(e.target.checked)}
+                className="sr-only peer cursor-pointer"
+              />
+              <div className="w-9 h-5 bg-slate-300 dark:bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500"></div>
+            </label>
+          </div>
+
+          {testResult && (
+            <div className={`p-3 rounded-xl text-xs flex items-center gap-2 ${
+              testResult.success 
+                ? 'bg-emerald-500/15 border border-emerald-500/30 text-emerald-200' 
+                : 'bg-rose-500/15 border border-rose-500/30 text-rose-200'
+            }`}>
+              {testResult.success ? <Check className="w-4 h-4 text-emerald-400 shrink-0" /> : <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />}
+              <span>{testResult.message}</span>
+            </div>
+          )}
+
+          {syncResult && (
+            <div className={`p-3 rounded-xl text-xs flex items-center gap-2 ${
+              syncResult.success 
+                ? 'bg-emerald-500/15 border border-emerald-500/30 text-emerald-200' 
+                : 'bg-rose-500/15 border border-rose-500/30 text-rose-200'
+            }`}>
+              {syncResult.success ? <Check className="w-4 h-4 text-emerald-400 shrink-0" /> : <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />}
+              <span>{syncResult.message}</span>
+            </div>
+          )}
+
+          {/* Action buttons */}
+          <div className="flex flex-wrap gap-3.5 pt-1">
+            <button
+              type="button"
+              onClick={handleSaveSupabase}
+              className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold cursor-pointer transition-all active:scale-95 shadow-md"
+            >
+              Save Setup Config
+            </button>
+            <button
+              type="button"
+              onClick={handleTestSupabase}
+              disabled={testingSupabase || !supabaseUrl || !supabaseAnonKey}
+              className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer transition-all active:scale-95 disabled:opacity-40"
+            >
+              {testingSupabase ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+              Test Connection
+            </button>
+            <button
+              type="button"
+              onClick={handleSyncAllToSupabase}
+              disabled={syncingAll || !supabaseUrl || !supabaseAnonKey}
+              className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer transition-all active:scale-95 disabled:opacity-40"
+            >
+              {syncingAll ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Database className="w-3.5 h-3.5" />}
+              Export & Sync All (1-Click)
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowDdl(!showDdl)}
+              className="px-5 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-all active:scale-95"
+            >
+              Setup Database DDL
+            </button>
+          </div>
+
+          {/* Setup Code snippet block */}
+          {showDdl && (
+            <div className="space-y-3 p-4 rounded-2xl bg-slate-950/40 border border-white/10 font-mono text-left">
+              <div className="flex justify-between items-center pb-2 border-b border-white/10">
+                <span className="text-[10px] font-bold text-slate-400">POSTGRESQL TABLE SCHEMA</span>
+                <button
+                  type="button"
+                  onClick={handleCopyDdl}
+                  className="p-1 rounded hover:bg-white/10 text-slate-300 hover:text-white flex items-center gap-1 text-[10px] cursor-pointer"
+                >
+                  {copiedDdl ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  {copiedDdl ? 'Copied!' : 'Copy Script'}
+                </button>
+              </div>
+              <pre className="text-[10px] text-emerald-400 overflow-x-auto max-h-56 leading-relaxed whitespace-pre font-mono">
+                {getSupabaseDDL()}
+              </pre>
+            </div>
+          )}
         </div>
       </div>
 

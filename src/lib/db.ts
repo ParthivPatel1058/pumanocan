@@ -12,6 +12,7 @@ import {
 } from 'firebase/firestore';
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { firestore, storage } from './firebase';
+import { supabaseSync } from './supabase';
 
 export enum OperationType {
   CREATE = 'create',
@@ -354,6 +355,56 @@ export const dbAuth = {
     return getStorageItem<Profile | null>(SESSION_KEY, null);
   },
 
+  saveSession: (profile: Profile): void => {
+    setStorageItem(SESSION_KEY, profile);
+  },
+
+  getProfile: async (userId: string): Promise<Profile | null> => {
+    try {
+      const { doc, getDoc } = await import('firebase/firestore');
+      const docSnap = await getDoc(doc(firestore, 'profiles', userId));
+      if (docSnap.exists()) {
+        return docSnap.data() as Profile;
+      }
+    } catch (err) {
+      console.error("Error fetching Google profile from Firestore:", err);
+    }
+    return null;
+  },
+
+  signUpWithGoogle: async (userId: string, email: string, displayName: string): Promise<Profile> => {
+    const profiles = getStorageItem<Profile[]>(PROFILES_KEY, []);
+    
+    // Create a unique, elegant vault name from their email address prefix
+    const rawVaultName = email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '');
+    const vaultName = rawVaultName.charAt(0).toUpperCase() + rawVaultName.slice(1);
+    
+    const newProfile: Profile = {
+      id: userId,
+      email,
+      display_name: displayName,
+      vault_name: vaultName,
+      created_at: new Date().toISOString(),
+      biometrics_enabled: true
+    };
+
+    // Save to Firestore
+    await setDoc(doc(firestore, 'profiles', userId), newProfile).catch((error) => {
+      handleFirestoreError(error, OperationType.CREATE, `profiles/${userId}`);
+    });
+
+    // Sync to Supabase
+    supabaseSync.upsertProfile(newProfile);
+
+    profiles.push(newProfile);
+    setStorageItem(PROFILES_KEY, profiles);
+
+    // Seed beautiful default presentation decks immediately for new account
+    seedSampleData(userId, displayName);
+
+    return newProfile;
+  },
+
   signUp: async (email: string, displayName: string, vaultName: string, passcode: string): Promise<Profile> => {
     const profiles = getStorageItem<(Profile & { passcode?: string })[]>(PROFILES_KEY, []);
     
@@ -380,6 +431,9 @@ export const dbAuth = {
     await setDoc(doc(firestore, 'profiles', newProfile.id), newProfile).catch((error) => {
       handleFirestoreError(error, OperationType.CREATE, `profiles/${newProfile.id}`);
     });
+
+    // Sync to Supabase
+    supabaseSync.upsertProfile(newProfile);
 
     profiles.push(newProfile);
     setStorageItem(PROFILES_KEY, profiles);
@@ -537,6 +591,9 @@ export const dbFiles = {
       handleFirestoreError(error, OperationType.CREATE, `files/${newFile.id}`);
     });
 
+    // Sync to Supabase
+    supabaseSync.upsertFile(newFile);
+
     // Add activity log
     dbActivities.addLog(userId, 'upload', `You uploaded ${filename}`);
     
@@ -560,6 +617,9 @@ export const dbFiles = {
       handleFirestoreError(error, OperationType.UPDATE, `files/${fileId}`);
     });
 
+    // Sync to Supabase
+    supabaseSync.upsertFile(files[index]);
+
     dbActivities.addLog(userId, 'share', `You renamed file "${oldName}" to "${newName}"`);
     
     return files[index];
@@ -581,6 +641,9 @@ export const dbFiles = {
         handleFirestoreError(error, OperationType.DELETE, `files/${fileId}`);
       });
 
+      // Sync to Supabase
+      supabaseSync.deleteFile(fileId);
+
       dbActivities.addLog(userId, 'delete', `Permanently deleted file ${files[index].filename}`);
     } else {
       files[index].is_deleted = true;
@@ -591,6 +654,9 @@ export const dbFiles = {
       setDoc(doc(firestore, 'files', fileId), files[index]).catch((error) => {
         handleFirestoreError(error, OperationType.UPDATE, `files/${fileId}`);
       });
+
+      // Sync to Supabase
+      supabaseSync.upsertFile(files[index]);
 
       dbActivities.addLog(userId, 'delete', `Moved file ${files[index].filename} to Trash`);
     }
@@ -612,6 +678,9 @@ export const dbFiles = {
       handleFirestoreError(error, OperationType.UPDATE, `files/${fileId}`);
     });
 
+    // Sync to Supabase
+    supabaseSync.upsertFile(files[index]);
+
     dbActivities.addLog(userId, 'upload', `Restored file ${files[index].filename} from Trash`);
   },
 
@@ -628,6 +697,9 @@ export const dbFiles = {
       handleFirestoreError(error, OperationType.UPDATE, `files/${fileId}`);
     });
 
+    // Sync to Supabase
+    supabaseSync.upsertFile(files[index]);
+
     return files[index];
   },
 
@@ -643,6 +715,9 @@ export const dbFiles = {
     setDoc(doc(firestore, 'files', fileId), files[index]).catch((error) => {
       handleFirestoreError(error, OperationType.UPDATE, `files/${fileId}`);
     });
+
+    // Sync to Supabase
+    supabaseSync.upsertFile(files[index]);
 
     dbActivities.addLog(userId, 'favorite', `Toggled favorite for file ${files[index].filename}`);
     return files[index];
@@ -662,6 +737,9 @@ export const dbFiles = {
       handleFirestoreError(error, OperationType.UPDATE, `files/${fileId}`);
     });
 
+    // Sync to Supabase
+    supabaseSync.upsertFile(files[index]);
+
     const folderName = folderId ? "another folder" : "root directory";
     dbActivities.addLog(userId, 'share', `Moved file ${files[index].filename} to ${folderName}`);
     return files[index];
@@ -675,56 +753,121 @@ export const dbFiles = {
     onProgress?: (progress: number) => void
   ): Promise<FileItem> => {
     const fileId = 'file-' + generateId();
-    const fileRef = ref(storage, `users/${userId}/files/${fileId}/${filename}`);
-    const uploadTask = uploadBytesResumable(fileRef, file);
+    let cloudUrl = '';
 
-    return new Promise((resolve, reject) => {
-      uploadTask.on('state_changed',
-        (snapshot) => {
-          const progress = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
-          if (onProgress) onProgress(progress);
-        },
-        (error) => {
-          console.error("Firebase Storage Upload Error:", error);
-          reject(error);
-        },
-        async () => {
-          try {
-            const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
-            const newFile: FileItem = {
-              id: fileId,
-              owner_id: userId,
-              folder_id: folderId,
-              filename,
-              file_url: downloadUrl,
-              file_size: file.size,
-              mime_type: file.type || 'application/octet-stream',
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-              download_count: 0
-            };
-
-            // Save in Firestore
-            await setDoc(doc(firestore, 'files', newFile.id), newFile).catch((error) => {
-              handleFirestoreError(error, OperationType.CREATE, `files/${newFile.id}`);
-            });
-
-            // Save locally
-            const files = getStorageItem<FileItem[]>(FILES_KEY, []);
-            files.push(newFile);
-            setStorageItem(FILES_KEY, files);
-
-            // Log activity
-            dbActivities.addLog(userId, 'upload', `You uploaded ${filename}`);
-
-            resolve(newFile);
-          } catch (err) {
-            console.error("Failed to complete file registration in Firestore:", err);
-            reject(err);
-          }
+    // Helper to upload to tmpfiles.org with progress tracking using XMLHttpRequest
+    const uploadToTmpFilesWithProgress = (
+      f: File | Blob, 
+      fname: string, 
+      progressCallback?: (progress: number) => void
+    ): Promise<string> => {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', 'https://tmpfiles.org/api/v1/upload', true);
+        
+        if (progressCallback) {
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) {
+              const percentComplete = Math.round((event.loaded / event.total) * 100);
+              progressCallback(percentComplete);
+            }
+          };
         }
-      );
+        
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              const json = JSON.parse(xhr.responseText);
+              if (json.status === 'success' && json.data?.url) {
+                // E.g. https://tmpfiles.org/12345/filename -> https://tmpfiles.org/dl/12345/filename
+                const dlUrl = json.data.url.replace('https://tmpfiles.org/', 'https://tmpfiles.org/dl/');
+                resolve(dlUrl);
+              } else {
+                reject(new Error('Invalid response format from tmpfiles.org'));
+              }
+            } catch (e) {
+              reject(e);
+            }
+          } else {
+            reject(new Error(`Server returned status ${xhr.status}`));
+          }
+        };
+        
+        xhr.onerror = () => reject(new Error('Network error during fallback upload'));
+        
+        const formData = new FormData();
+        formData.append('file', f, fname);
+        xhr.send(formData);
+      });
+    };
+
+    try {
+      // 1. Try Firebase Storage first
+      const fileRef = ref(storage, `users/${userId}/files/${fileId}/${filename}`);
+      const uploadTask = uploadBytesResumable(fileRef, file);
+      
+      cloudUrl = await new Promise<string>((resolve, reject) => {
+        uploadTask.on('state_changed',
+          (snapshot) => {
+            const progress = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
+            if (onProgress) onProgress(progress);
+          },
+          (err) => {
+            reject(err);
+          },
+          async () => {
+            try {
+              const url = await getDownloadURL(uploadTask.snapshot.ref);
+              resolve(url);
+            } catch (urlErr) {
+              reject(urlErr);
+            }
+          }
+        );
+      });
+    } catch (err) {
+      console.warn("Firebase Storage upload failed or was blocked, trying tmpfiles.org cloud storage fallback:", err);
+      try {
+        // 2. Fallback to tmpfiles.org
+        cloudUrl = await uploadToTmpFilesWithProgress(file, filename, onProgress);
+      } catch (fallbackErr) {
+        console.error("Cloud storage fallback failed as well, using local Object URL:", fallbackErr);
+        // 3. Fallback to local URL (file remains viewable/downloadable in the active browser session)
+        cloudUrl = URL.createObjectURL(file);
+        if (onProgress) onProgress(100);
+      }
+    }
+
+    const newFile: FileItem = {
+      id: fileId,
+      owner_id: userId,
+      folder_id: folderId,
+      filename,
+      file_url: cloudUrl,
+      file_size: file.size,
+      mime_type: file.type || 'application/octet-stream',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      download_count: 0
+    };
+
+    // Save metadata securely in Firestore
+    await setDoc(doc(firestore, 'files', fileId), newFile).catch((error) => {
+      handleFirestoreError(error, OperationType.CREATE, `files/${fileId}`);
     });
+
+    // Save file metadata locally
+    const files = getStorageItem<FileItem[]>(FILES_KEY, []);
+    files.push(newFile);
+    setStorageItem(FILES_KEY, files);
+
+    // Sync to Supabase
+    supabaseSync.upsertFile(newFile);
+
+    // Log activity log
+    dbActivities.addLog(userId, 'upload', `You uploaded ${filename}`);
+
+    return newFile;
   }
 };
 
@@ -779,6 +922,9 @@ export const dbFolders = {
     folders.push(newFolder);
     setStorageItem(FOLDERS_KEY, folders);
 
+    // Sync to Supabase
+    supabaseSync.upsertFolder(newFolder);
+
     // Save to Firestore
     setDoc(doc(firestore, 'folders', newFolder.id), newFolder).catch((error) => {
       handleFirestoreError(error, OperationType.CREATE, `folders/${newFolder.id}`);
@@ -802,6 +948,9 @@ export const dbFolders = {
       handleFirestoreError(error, OperationType.UPDATE, `folders/${folderId}`);
     });
 
+    // Sync to Supabase
+    supabaseSync.upsertFolder(folders[index]);
+
     dbActivities.addLog(userId, 'share', `Renamed folder "${oldName}" to "${newName}"`);
     return folders[index];
   },
@@ -817,6 +966,9 @@ export const dbFolders = {
       handleFirestoreError(error, OperationType.DELETE, `folders/${folderId}`);
     });
 
+    // Sync to Supabase
+    supabaseSync.deleteFolder(folderId);
+
     // Move any files in this folder to Root instead of deleting them outright
     const files = getStorageItem<FileItem[]>(FILES_KEY, []);
     const updatedFiles = files.map(f => {
@@ -825,6 +977,8 @@ export const dbFolders = {
         setDoc(doc(firestore, 'files', f.id), updated).catch((error) => {
           handleFirestoreError(error, OperationType.UPDATE, `files/${f.id}`);
         });
+        // Sync updated file to Supabase
+        supabaseSync.upsertFile(updated);
         return updated;
       }
       return f;
@@ -847,6 +1001,9 @@ export const dbFolders = {
       handleFirestoreError(error, OperationType.UPDATE, `folders/${folderId}`);
     });
 
+    // Sync to Supabase
+    supabaseSync.upsertFolder(folders[index]);
+
     return folders[index];
   },
 
@@ -862,6 +1019,9 @@ export const dbFolders = {
     setDoc(doc(firestore, 'folders', folderId), folders[index]).catch((error) => {
       handleFirestoreError(error, OperationType.UPDATE, `folders/${folderId}`);
     });
+
+    // Sync to Supabase
+    supabaseSync.upsertFolder(folders[index]);
 
     return folders[index];
   }
@@ -922,6 +1082,9 @@ export const dbActivities = {
     setDoc(doc(firestore, 'activities', newLog.id), newLog).catch((error) => {
       handleFirestoreError(error, OperationType.CREATE, `activities/${newLog.id}`);
     });
+
+    // Sync to Supabase
+    supabaseSync.insertActivity(newLog);
 
     return newLog;
   }

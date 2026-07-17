@@ -6,10 +6,11 @@ import { AppSettings } from '../types';
 interface LandingPageProps {
   onGetStarted: () => void;
   onSignInClick: () => void;
+  onPresentModeClick: () => void;
   settings: AppSettings;
 }
 
-export default function LandingPage({ onGetStarted, onSignInClick, settings }: LandingPageProps) {
+export default function LandingPage({ onGetStarted, onSignInClick, onPresentModeClick, settings }: LandingPageProps) {
   const { darkMode } = settings;
 
   return (
@@ -27,16 +28,24 @@ export default function LandingPage({ onGetStarted, onSignInClick, settings }: L
 
         <div className="flex items-center gap-4">
           <button 
+            id="nav-present-btn"
+            onClick={onPresentModeClick}
+            className="px-4.5 py-2.5 rounded-full bg-white/10 hover:bg-white/15 text-[#ebd2b4] dark:text-[#ebd2b4] text-xs font-semibold flex items-center gap-1.5 border border-white/25 shadow-sm active:scale-95 transition-all cursor-pointer"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+            Yoyo Present
+          </button>
+          <button 
             id="nav-signin-btn"
             onClick={onSignInClick}
-            className="px-5 py-2 rounded-full font-sans font-medium text-sm transition-all duration-300 hover:bg-white/15 active:scale-95 border border-transparent hover:border-white/20 dark:text-white"
+            className="px-5 py-2 rounded-full font-sans font-medium text-sm transition-all duration-300 hover:bg-white/15 active:scale-95 border border-transparent hover:border-white/20 dark:text-white cursor-pointer"
           >
             Sign In
           </button>
           <button 
             id="nav-getstarted-btn"
             onClick={onGetStarted}
-            className="px-6 py-2.5 rounded-full bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white font-sans font-medium text-sm shadow-md transition-all duration-300"
+            className="px-6 py-2.5 rounded-full bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white font-sans font-medium text-sm shadow-md transition-all duration-300 cursor-pointer"
           >
             Get Started
           </button>

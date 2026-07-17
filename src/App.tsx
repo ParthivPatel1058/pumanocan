@@ -12,8 +12,9 @@ import SettingsPage from './components/SettingsPage';
 import CommandPalette from './components/CommandPalette';
 import YoyoPresentMode from './components/YoyoPresentMode';
 import { Cloud, Lock } from 'lucide-react';
-import { collection, query, where, onSnapshot } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, doc, setDoc } from 'firebase/firestore';
 import { firestore } from './lib/firebase';
+import { supabaseSync } from './lib/supabase';
 
 export default function App() {
   // Screen Route state: 'landing' | 'auth' | 'app'
@@ -21,6 +22,7 @@ export default function App() {
   
   // Current tab in main app: 'dashboard' | 'files' | 'recent' | 'shared' | 'favorites' | 'trash' | 'settings' | 'yoyo-present'
   const [currentTab, setCurrentTab] = useState<string>('dashboard');
+  const [postAuthTab, setPostAuthTab] = useState<string>('dashboard');
 
   // Active User session
   const [user, setUser] = useState<Profile | null>(null);
@@ -167,7 +169,8 @@ export default function App() {
   const handleAuthSuccess = (profile: Profile) => {
     setUser(profile);
     setRoute('app');
-    setCurrentTab('dashboard');
+    setCurrentTab(postAuthTab);
+    setPostAuthTab('dashboard');
     loadUserData(profile.id);
     syncWithCloud(profile.id);
   };
@@ -259,9 +262,20 @@ export default function App() {
     const profiles = JSON.parse(localStorage.getItem('pumanocan_profiles') || '[]');
     const index = profiles.findIndex((p: any) => p.id === user.id);
     if (index !== -1) {
-      profiles[index].passcode = await import('./lib/crypto').then(c => c.encryptData(newPasscode, 'pumanocan-vault-passcode-key'));
+      const encrypted = await import('./lib/crypto').then(c => c.encryptData(newPasscode, 'pumanocan-vault-passcode-key'));
+      profiles[index].passcode = encrypted;
       localStorage.setItem('pumanocan_profiles', JSON.stringify(profiles));
-      setUser({ ...user, passcode: profiles[index].passcode });
+      
+      const updatedUser = { ...user, passcode: encrypted };
+      setUser(updatedUser);
+
+      // Save to Firestore
+      await setDoc(doc(firestore, 'profiles', user.id), updatedUser).catch(err => {
+        console.error('Failed to update passcode in Firestore:', err);
+      });
+
+      // Sync to Supabase
+      supabaseSync.upsertProfile(updatedUser);
     }
   };
 
@@ -279,6 +293,15 @@ export default function App() {
           }}
           onSignInClick={() => {
             setRoute('auth');
+          }}
+          onPresentModeClick={() => {
+            if (user) {
+              setRoute('app');
+              setCurrentTab('yoyo-present');
+            } else {
+              setPostAuthTab('yoyo-present');
+              setRoute('auth');
+            }
           }}
           settings={settings}
         />

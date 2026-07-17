@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { Profile } from '../types';
 import { dbAuth } from '../lib/db';
+import { googleSignIn } from '../lib/firebase';
 
 interface AuthPageProps {
   onAuthSuccess: (profile: Profile) => void;
@@ -74,6 +75,43 @@ export default function AuthPage({ onAuthSuccess, onBackToLanding }: AuthPagePro
       onAuthSuccess(profile);
     } catch (err: any) {
       setError(err.message || "Failed to create Vault.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Handle Google OAuth Sign-In & Registration
+  const handleGoogleSignInClick = async () => {
+    setError(null);
+    setLoading(true);
+    try {
+      const authResult = await googleSignIn();
+      if (authResult) {
+        const { user: firebaseUser } = authResult;
+        
+        let profile = await dbAuth.getProfile(firebaseUser.uid);
+        if (!profile) {
+          // New sign up
+          profile = await dbAuth.signUpWithGoogle(
+            firebaseUser.uid,
+            firebaseUser.email || 'user@gmail.com',
+            firebaseUser.displayName || 'Google User'
+          );
+        } else {
+          // Existing profile, sync it back into local profiles array
+          const profiles = JSON.parse(localStorage.getItem('pumanocan_profiles') || '[]');
+          if (!profiles.some((p: any) => p.id === profile?.id)) {
+            profiles.push(profile);
+            localStorage.setItem('pumanocan_profiles', JSON.stringify(profiles));
+          }
+        }
+        
+        dbAuth.saveSession(profile);
+        onAuthSuccess(profile);
+      }
+    } catch (err: any) {
+      console.error("Google Sign-In error:", err);
+      setError(err?.message || "Google Sign-In failed.");
     } finally {
       setLoading(false);
     }
@@ -623,6 +661,44 @@ export default function AuthPage({ onAuthSuccess, onBackToLanding }: AuthPagePro
             )}
 
           </AnimatePresence>
+
+          {authMode !== 'forgot' && (
+            <div className="mt-5 space-y-4">
+              <div className="relative flex py-2 items-center w-full">
+                <div className="flex-grow border-t border-white/10"></div>
+                <span className="flex-shrink mx-4 text-white/40 text-[10px] font-bold uppercase tracking-wider">or</span>
+                <div className="flex-grow border-t border-white/10"></div>
+              </div>
+
+              <button
+                type="button"
+                id="google-sso-btn"
+                onClick={handleGoogleSignInClick}
+                disabled={loading}
+                className="w-full py-3 px-6 rounded-full bg-white hover:bg-slate-100 text-slate-800 font-semibold text-sm transition-all shadow-lg active:scale-98 flex items-center justify-center gap-2.5 cursor-pointer border border-white/20 disabled:opacity-50"
+              >
+                <svg className="w-4 h-4" viewBox="0 0 24 24">
+                  <path
+                    fill="#4285F4"
+                    d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v3.9h6.6c-.28 1.5-.1.88-1.5 1.83v2.52h2.4c1.4-1.3 2.2-3.2 2.2-5.46z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-2.4-2.52c-.67.45-1.52.72-2.53.72-2.52 0-4.66-1.7-5.42-3.99H3.14v2.6C5.12 19.88 8.35 24 12 24z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M6.58 13.3c-.2-.59-.31-1.22-.31-1.8c0-.58.11-1.21.31-1.8V7.1H3.14C2.06 9.1 1.5 11.4 1.5 13.8s.56 4.7 1.64 6.7l3.44-2.7c-.2-.59-.31-1.22-.31-1.8z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M12 5.3c1.76 0 3.34.61 4.58 1.8l3.43-3.4C17.94 1.7 15.22.8 12 .8 8.35.8 5.12 4.92 3.14 8.7l3.44 2.7c.76-2.29 2.9-3.99 5.42-3.99z"
+                  />
+                </svg>
+                Continue with Google
+              </button>
+            </div>
+          )}
 
           {/* Card Footer Switch Links */}
           <div className="mt-6 pt-5 border-t border-white/10 text-center">
