@@ -12,7 +12,7 @@ import {
 } from 'firebase/firestore';
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { firestore, storage } from './firebase';
-import { supabaseSync } from './supabase';
+import { supabaseSync, getSupabaseConfig, getSupabaseClient } from './supabase';
 
 export enum OperationType {
   CREATE = 'create',
@@ -752,18 +752,55 @@ export const dbFiles = {
     folderId: string | null = null,
     onProgress?: (progress: number) => void
   ): Promise<FileItem> => {
+    if (!userId) {
+      throw new Error("Authentication session is required to upload files.");
+    }
+
     const fileId = 'file-' + generateId();
     let cloudUrl = '';
 
-    // Helper to upload to tmpfiles.org with progress tracking using XMLHttpRequest
-    const uploadToTmpFilesWithProgress = (
+    // 1. Handle duplicate filenames correctly
+    const files = getStorageItem<FileItem[]>(FILES_KEY, []);
+    let resolvedFilename = filename;
+    let extension = '';
+    let nameWithoutExt = filename;
+    
+    const lastDotIndex = filename.lastIndexOf('.');
+    if (lastDotIndex !== -1) {
+      nameWithoutExt = filename.substring(0, lastDotIndex);
+      extension = filename.substring(lastDotIndex);
+    }
+    
+    let counter = 1;
+    while (files.some(f => f.owner_id === userId && f.folder_id === folderId && f.filename === resolvedFilename)) {
+      resolvedFilename = `${nameWithoutExt} (${counter})${extension}`;
+      counter++;
+    }
+
+    // 2. Isolate path inside storage: user_id/folder_name/file.ext
+    let folderName = 'root';
+    if (folderId) {
+      const folders = getStorageItem<Folder[]>(FOLDERS_KEY, []);
+      const folder = folders.find(f => f.id === folderId);
+      if (folder) {
+        folderName = folder.folder_name;
+      }
+    }
+    const cleanFolderName = folderName.replace(/[^a-zA-Z0-9_\-\s]/g, '').trim() || 'folder';
+    const storagePath = `${userId}/${cleanFolderName}/${resolvedFilename}`;
+
+    const { url: supabaseUrl, anonKey, enabled: supabaseEnabled } = getSupabaseConfig();
+    const supabaseClient = getSupabaseClient();
+
+    // Helper to upload to file.io with progress tracking using XMLHttpRequest
+    const uploadToFileIoWithProgress = (
       f: File | Blob, 
       fname: string, 
       progressCallback?: (progress: number) => void
     ): Promise<string> => {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        xhr.open('POST', 'https://tmpfiles.org/api/v1/upload', true);
+        xhr.open('POST', 'https://file.io/', true);
         
         if (progressCallback) {
           xhr.upload.onprogress = (event) => {
@@ -778,12 +815,10 @@ export const dbFiles = {
           if (xhr.status >= 200 && xhr.status < 300) {
             try {
               const json = JSON.parse(xhr.responseText);
-              if (json.status === 'success' && json.data?.url) {
-                // E.g. https://tmpfiles.org/12345/filename -> https://tmpfiles.org/dl/12345/filename
-                const dlUrl = json.data.url.replace('https://tmpfiles.org/', 'https://tmpfiles.org/dl/');
-                resolve(dlUrl);
+              if (json.success && json.link) {
+                resolve(json.link);
               } else {
-                reject(new Error('Invalid response format from tmpfiles.org'));
+                reject(new Error('Invalid response format from file.io'));
               }
             } catch (e) {
               reject(e);
@@ -801,48 +836,152 @@ export const dbFiles = {
       });
     };
 
-    try {
-      // 1. Try Firebase Storage first
-      const fileRef = ref(storage, `users/${userId}/files/${fileId}/${filename}`);
-      const uploadTask = uploadBytesResumable(fileRef, file);
-      
-      cloudUrl = await new Promise<string>((resolve, reject) => {
-        uploadTask.on('state_changed',
-          (snapshot) => {
-            const progress = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
-            if (onProgress) onProgress(progress);
-          },
-          (err) => {
-            reject(err);
-          },
-          async () => {
-            try {
-              const url = await getDownloadURL(uploadTask.snapshot.ref);
-              resolve(url);
-            } catch (urlErr) {
-              reject(urlErr);
+    // Helper to upload to Supabase Storage with XMLHttpRequest for progress tracking
+    const uploadToSupabaseWithProgress = (
+      f: File | Blob,
+      path: string,
+      sUrl: string,
+      sKey: string,
+      progressCallback?: (progress: number) => void
+    ): Promise<string> => {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const uploadUrl = `${sUrl}/storage/v1/object/pumanocan-vault/${encodeURIComponent(path)}`;
+        
+        xhr.open('POST', uploadUrl, true);
+        xhr.setRequestHeader('Authorization', `Bearer ${sKey}`);
+        xhr.setRequestHeader('apikey', sKey);
+        xhr.setRequestHeader('x-upsert', 'true');
+        
+        if (progressCallback) {
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) {
+              const percentComplete = Math.round((event.loaded / event.total) * 100);
+              progressCallback(percentComplete);
             }
+          };
+        }
+        
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            const publicUrl = `${sUrl}/storage/v1/object/public/pumanocan-vault/${encodeURIComponent(path)}`;
+            resolve(publicUrl);
+          } else {
+            reject(new Error(`Supabase REST upload returned status ${xhr.status}: ${xhr.responseText}`));
           }
-        );
+        };
+        
+        xhr.onerror = () => reject(new Error('Network error during Supabase REST upload'));
+        xhr.send(f);
       });
-    } catch (err) {
-      console.warn("Firebase Storage upload failed or was blocked, trying tmpfiles.org cloud storage fallback:", err);
+    };
+
+    // Tier 1: Try Supabase if enabled
+    if (supabaseEnabled && supabaseClient && supabaseUrl && anonKey) {
       try {
-        // 2. Fallback to tmpfiles.org
-        cloudUrl = await uploadToTmpFilesWithProgress(file, filename, onProgress);
+        console.log(`Starting Supabase upload to bucket: pumanocan-vault at path: ${storagePath}`);
+        
+        // Ensure bucket exists
+        try {
+          const { data: buckets } = await supabaseClient.storage.listBuckets();
+          const bucketExists = buckets?.some(b => b.name === 'pumanocan-vault');
+          if (!bucketExists) {
+            console.log("Bucket pumanocan-vault does not exist, creating...");
+            await supabaseClient.storage.createBucket('pumanocan-vault', {
+              public: true,
+              fileSizeLimit: 104857600 // 100MB
+            });
+          }
+        } catch (bErr) {
+          console.warn("Could not list or create bucket, attempting upload anyway:", bErr);
+        }
+
+        // Try XHR first for progress
+        try {
+          cloudUrl = await uploadToSupabaseWithProgress(file, storagePath, supabaseUrl, anonKey, onProgress);
+          console.log("Supabase REST upload succeeded. Public URL:", cloudUrl);
+        } catch (xhrErr) {
+          console.warn("Supabase REST upload failed, falling back to official SDK upload method:", xhrErr);
+          // Fallback to official SDK
+          const { error: uploadError } = await supabaseClient.storage
+            .from('pumanocan-vault')
+            .upload(storagePath, file, { upsert: true });
+            
+          if (uploadError) throw uploadError;
+          
+          const { data } = supabaseClient.storage.from('pumanocan-vault').getPublicUrl(storagePath);
+          cloudUrl = data.publicUrl;
+          if (onProgress) onProgress(100);
+          console.log("Supabase SDK upload succeeded. Public URL:", cloudUrl);
+        }
+      } catch (err: any) {
+        console.error("All Supabase upload attempts failed, falling back to other tiers:", err);
+      }
+    }
+
+    // Tier 2: Try Firebase Storage
+    if (!cloudUrl) {
+      try {
+        console.log("Attempting Firebase Storage upload...");
+        const fileRef = ref(storage, `users/${userId}/files/${fileId}/${resolvedFilename}`);
+        const uploadTask = uploadBytesResumable(fileRef, file);
+        
+        cloudUrl = await new Promise<string>((resolve, reject) => {
+          // Add a 10-second timeout to prevent getting frozen indefinitely
+          const timeoutId = setTimeout(() => {
+            console.warn("Firebase Storage upload timed out after 10s, triggering fallback.");
+            uploadTask.cancel();
+            reject(new Error("Firebase Storage upload timed out."));
+          }, 10000);
+
+          uploadTask.on('state_changed',
+            (snapshot) => {
+              const progress = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
+              if (onProgress) onProgress(progress);
+            },
+            (err) => {
+              clearTimeout(timeoutId);
+              reject(err);
+            },
+            async () => {
+              clearTimeout(timeoutId);
+              try {
+                const url = await getDownloadURL(uploadTask.snapshot.ref);
+                resolve(url);
+              } catch (urlErr) {
+                reject(urlErr);
+              }
+            }
+          );
+        });
+        console.log("Firebase Storage upload succeeded:", cloudUrl);
+      } catch (err) {
+        console.warn("Firebase Storage upload failed or timed out, trying file.io cloud storage fallback:", err);
+      }
+    }
+
+    // Tier 3: Try file.io fallback
+    if (!cloudUrl) {
+      try {
+        cloudUrl = await uploadToFileIoWithProgress(file, resolvedFilename, onProgress);
+        console.log("file.io fallback upload succeeded:", cloudUrl);
       } catch (fallbackErr) {
         console.error("Cloud storage fallback failed as well, using local Object URL:", fallbackErr);
-        // 3. Fallback to local URL (file remains viewable/downloadable in the active browser session)
-        cloudUrl = URL.createObjectURL(file);
-        if (onProgress) onProgress(100);
       }
+    }
+
+    // Tier 4: Local URL fallback (file remains viewable/downloadable in the active browser session)
+    if (!cloudUrl) {
+      cloudUrl = URL.createObjectURL(file);
+      if (onProgress) onProgress(100);
+      console.log("Local URL fallback used:", cloudUrl);
     }
 
     const newFile: FileItem = {
       id: fileId,
       owner_id: userId,
       folder_id: folderId,
-      filename,
+      filename: resolvedFilename,
       file_url: cloudUrl,
       file_size: file.size,
       mime_type: file.type || 'application/octet-stream',
@@ -857,15 +996,15 @@ export const dbFiles = {
     });
 
     // Save file metadata locally
-    const files = getStorageItem<FileItem[]>(FILES_KEY, []);
-    files.push(newFile);
-    setStorageItem(FILES_KEY, files);
+    const updatedFiles = getStorageItem<FileItem[]>(FILES_KEY, []);
+    updatedFiles.push(newFile);
+    setStorageItem(FILES_KEY, updatedFiles);
 
     // Sync to Supabase
     supabaseSync.upsertFile(newFile);
 
-    // Log activity log
-    dbActivities.addLog(userId, 'upload', `You uploaded ${filename}`);
+    // Log activity
+    dbActivities.addLog(userId, 'upload', `You uploaded ${resolvedFilename}`);
 
     return newFile;
   }

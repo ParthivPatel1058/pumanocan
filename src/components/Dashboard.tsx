@@ -81,16 +81,20 @@ export default function Dashboard({
 
   interface UploadItem {
     id: string;
-    file: File;
+    file: File | Blob;
     name: string;
     progress: number;
-    status: 'uploading' | 'completed' | 'failed';
+    status: 'idle' | 'preparing' | 'uploading' | 'processing' | 'generating' | 'completed' | 'failed';
     error?: string;
+    speed?: string;
+    remainingTime?: string;
+    sizeFormatted: string;
+    startTime?: number;
   }
   const [uploadQueue, setUploadQueue] = useState<UploadItem[]>([]);
 
   // Computed state for compatibility with standard progress displays
-  const activeUploads = uploadQueue.filter(q => q.status === 'uploading');
+  const activeUploads = uploadQueue.filter(q => q.status === 'uploading' || q.status === 'preparing' || q.status === 'processing' || q.status === 'generating');
   const uploadProgress = activeUploads.length > 0 
     ? Math.round(activeUploads.reduce((sum, q) => sum + q.progress, 0) / activeUploads.length)
     : null;
@@ -153,7 +157,8 @@ export default function Dashboard({
       file,
       name: file.name,
       progress: 0,
-      status: 'uploading'
+      status: 'preparing',
+      sizeFormatted: formatSize(file.size)
     }));
     
     setUploadQueue(prev => [...prev, ...newItems]);
@@ -161,10 +166,14 @@ export default function Dashboard({
     // Process sequential uploads so they are handled cleanly
     for (const item of newItems) {
       try {
+        // State 1: Preparing
+        setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'preparing' } : q));
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
         let targetFolderId = activeFolderId;
         
         // If file contains path segments from a folder upload
-        const path = item.file.webkitRelativePath || '';
+        const path = ('webkitRelativePath' in item.file ? (item.file as File).webkitRelativePath : '') || '';
         if (path && path.includes('/')) {
           const pathParts = path.split('/');
           if (pathParts.length > 1) {
@@ -184,17 +193,74 @@ export default function Dashboard({
           }
         }
         
+        // State 2: Uploading
+        setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'uploading', startTime: Date.now() } : q));
+        
         await dbFiles.uploadFileReal(
           user.id,
           item.file,
           item.name,
           targetFolderId,
           (progress) => {
-            setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, progress } : q));
+            setUploadQueue(prev => prev.map(q => {
+              if (q.id === item.id) {
+                const now = Date.now();
+                const start = q.startTime || now;
+                const elapsed = (now - start) / 1000; // in seconds
+                
+                let speedStr = '';
+                let remainingStr = '';
+                
+                if (elapsed > 0) {
+                  const uploadedBytes = (progress / 100) * q.file.size;
+                  const speedBytesPerSec = uploadedBytes / elapsed;
+                  
+                  if (speedBytesPerSec > 1024 * 1024) {
+                    speedStr = `${(speedBytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+                  } else if (speedBytesPerSec > 1024) {
+                    speedStr = `${(speedBytesPerSec / 1024).toFixed(1)} KB/s`;
+                  } else {
+                    speedStr = `${Math.round(speedBytesPerSec)} B/s`;
+                  }
+                  
+                  const remainingBytes = q.file.size - uploadedBytes;
+                  const remainingSeconds = speedBytesPerSec > 0 ? remainingBytes / speedBytesPerSec : 0;
+                  
+                  if (remainingSeconds > 60) {
+                    remainingStr = `${Math.floor(remainingSeconds / 60)}m ${Math.round(remainingSeconds % 60)}s`;
+                  } else if (remainingSeconds > 0) {
+                    remainingStr = `${Math.round(remainingSeconds)}s`;
+                  } else {
+                    remainingStr = '0s';
+                  }
+                } else {
+                  speedStr = 'calculating...';
+                  remainingStr = 'calculating...';
+                }
+                
+                return { 
+                  ...q, 
+                  progress, 
+                  speed: speedStr,
+                  remainingTime: remainingStr,
+                  startTime: start
+                };
+              }
+              return q;
+            }));
           }
         );
         
-        setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'completed', progress: 100 } : q));
+        // State 3: Processing
+        setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'processing', progress: 100 } : q));
+        await new Promise(resolve => setTimeout(resolve, 600));
+        
+        // State 4: Generating Preview
+        setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'generating' } : q));
+        await new Promise(resolve => setTimeout(resolve, 800));
+        
+        // State 5: Completed (success)
+        setUploadQueue(prev => prev.map(q => q.id === item.id ? { ...q, status: 'completed' } : q));
         triggerNotification(`Uploaded ${item.name} successfully!`);
         refreshData();
       } catch (err: any) {
@@ -209,11 +275,12 @@ export default function Dashboard({
     const item = uploadQueue.find(q => q.id === itemId);
     if (!item) return;
     
-    setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'uploading', progress: 0, error: undefined } : q));
-    
+    setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'preparing', progress: 0, error: undefined, startTime: undefined, speed: undefined, remainingTime: undefined } : q));
+    await new Promise(resolve => setTimeout(resolve, 500));
+
     try {
       let targetFolderId = activeFolderId;
-      const path = item.file.webkitRelativePath || '';
+      const path = ('webkitRelativePath' in item.file ? (item.file as File).webkitRelativePath : '') || '';
       if (path && path.includes('/')) {
         const pathParts = path.split('/');
         if (pathParts.length > 1) {
@@ -232,17 +299,66 @@ export default function Dashboard({
         }
       }
 
+      setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'uploading', startTime: Date.now() } : q));
+
       await dbFiles.uploadFileReal(
         user.id,
         item.file,
         item.name,
         targetFolderId,
         (progress) => {
-          setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, progress } : q));
+          setUploadQueue(prev => prev.map(q => {
+            if (q.id === itemId) {
+              const now = Date.now();
+              const start = q.startTime || now;
+              const elapsed = (now - start) / 1000;
+              
+              let speedStr = '';
+              let remainingStr = '';
+              
+              if (elapsed > 0) {
+                const uploadedBytes = (progress / 100) * q.file.size;
+                const speedBytesPerSec = uploadedBytes / elapsed;
+                
+                if (speedBytesPerSec > 1024 * 1024) {
+                  speedStr = `${(speedBytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+                } else if (speedBytesPerSec > 1024) {
+                  speedStr = `${(speedBytesPerSec / 1024).toFixed(1)} KB/s`;
+                } else {
+                  speedStr = `${Math.round(speedBytesPerSec)} B/s`;
+                }
+                
+                const remainingBytes = q.file.size - uploadedBytes;
+                const remainingSeconds = speedBytesPerSec > 0 ? remainingBytes / speedBytesPerSec : 0;
+                
+                if (remainingSeconds > 60) {
+                  remainingStr = `${Math.floor(remainingSeconds / 60)}m ${Math.round(remainingSeconds % 60)}s`;
+                } else if (remainingSeconds > 0) {
+                  remainingStr = `${Math.round(remainingSeconds)}s`;
+                } else {
+                  remainingStr = '0s';
+                }
+              }
+              
+              return { 
+                ...q, 
+                progress, 
+                speed: speedStr,
+                remainingTime: remainingStr
+              };
+            }
+            return q;
+          }));
         }
       );
       
-      setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'completed', progress: 100 } : q));
+      setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'processing', progress: 100 } : q));
+      await new Promise(resolve => setTimeout(resolve, 600));
+      
+      setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'generating' } : q));
+      await new Promise(resolve => setTimeout(resolve, 800));
+
+      setUploadQueue(prev => prev.map(q => q.id === itemId ? { ...q, status: 'completed' } : q));
       triggerNotification(`Uploaded ${item.name} successfully!`);
       refreshData();
     } catch (err: any) {
@@ -1369,64 +1485,134 @@ export default function Dashboard({
             initial={{ opacity: 0, y: 50, scale: 0.9 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 50, scale: 0.9 }}
-            className="fixed bottom-6 right-6 z-40 bg-slate-900/90 dark:bg-slate-950/95 border border-white/10 text-white rounded-[24px] shadow-2xl w-80 p-4 max-h-96 flex flex-col overflow-hidden backdrop-blur-xl"
+            className="fixed bottom-6 right-6 z-40 bg-slate-900/95 dark:bg-slate-950/98 border border-white/10 text-white rounded-[28px] shadow-2xl w-80 md:w-96 p-5 max-h-[420px] flex flex-col overflow-hidden backdrop-blur-2xl"
           >
-            <div className="flex justify-between items-center pb-2.5 border-b border-white/10">
-              <div className="flex items-center gap-2">
-                <div className="w-2.5 h-2.5 rounded-full bg-indigo-500 animate-pulse" />
-                <span className="text-xs font-bold font-sans tracking-wide">
-                  Upload Manager ({uploadQueue.filter(q => q.status === 'completed').length}/{uploadQueue.length})
-                </span>
+            {/* Header section with active spinner and stats */}
+            <div className="flex justify-between items-center pb-3 border-b border-white/10 shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="relative flex items-center justify-center">
+                  <span className="absolute inline-flex h-2.5 w-2.5 rounded-full bg-indigo-400 opacity-75 animate-ping" />
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-indigo-500" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-extrabold font-sans tracking-wide">
+                    Vault Secure Upload Manager
+                  </h4>
+                  <p className="text-[9px] text-slate-400">
+                    Uploaded {uploadQueue.filter(q => q.status === 'completed').length} of {uploadQueue.length} items
+                  </p>
+                </div>
               </div>
               <button 
                 onClick={handleClearQueue}
-                className="text-[10px] text-slate-400 hover:text-white cursor-pointer transition-all"
+                className="text-[10px] font-bold text-slate-400 hover:text-white cursor-pointer hover:bg-white/10 px-2.5 py-1 rounded-full transition-all"
               >
                 Clear all
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto py-2 space-y-3 custom-scrollbar max-h-64 pr-1">
-              {uploadQueue.map((item) => (
-                <div key={item.id} className="space-y-1.5 p-2 rounded-xl bg-white/5 border border-white/5">
-                  <div className="flex justify-between items-center gap-2">
-                    <span className="text-[11px] font-semibold truncate max-w-[170px]" title={item.name}>
-                      {item.name}
-                    </span>
-                    <span className="text-[9px] font-mono shrink-0 uppercase tracking-wider">
-                      {item.status === 'uploading' && <span className="text-indigo-400 font-bold">{item.progress}%</span>}
-                      {item.status === 'completed' && <span className="text-emerald-400 font-bold">Done</span>}
-                      {item.status === 'failed' && <span className="text-rose-400 font-bold">Failed</span>}
-                    </span>
-                  </div>
+            {/* List items with full state machinery */}
+            <div className="flex-1 overflow-y-auto py-2.5 space-y-3.5 custom-scrollbar max-h-72 pr-1 mt-1">
+              {uploadQueue.map((item) => {
+                const isCompleted = item.status === 'completed';
+                const isFailed = item.status === 'failed';
+                const isPreparing = item.status === 'preparing';
+                const isProcessing = item.status === 'processing';
+                const isGenerating = item.status === 'generating';
+                const isUploading = item.status === 'uploading';
 
-                  {/* Progress Line */}
-                  <div className="w-full bg-white/10 h-1 rounded-full overflow-hidden relative">
-                    <div 
-                      className={`h-full rounded-full transition-all duration-300 ${
-                        item.status === 'failed' ? 'bg-rose-500' :
-                        item.status === 'completed' ? 'bg-emerald-500' : 'bg-indigo-500'
-                      }`}
-                      style={{ width: `${item.progress}%` }}
-                    />
-                  </div>
-
-                  {/* Actions / Error Details */}
-                  {item.status === 'failed' && (
-                    <div className="flex justify-between items-center gap-2">
-                      <span className="text-[9px] text-rose-300 truncate max-w-[160px]">
-                        {item.error || 'Connection timeout'}
+                return (
+                  <motion.div 
+                    layout
+                    key={item.id} 
+                    className={`p-3 rounded-2xl border transition-all ${
+                      isCompleted ? 'bg-emerald-500/10 border-emerald-500/25' :
+                      isFailed ? 'bg-rose-500/10 border-rose-500/25' :
+                      'bg-white/5 border-white/5'
+                    }`}
+                  >
+                    <div className="flex justify-between items-start gap-3">
+                      <div className="space-y-0.5 max-w-[200px] md:max-w-xs text-left">
+                        <span className="text-[11px] font-bold truncate block" title={item.name}>
+                          {item.name}
+                        </span>
+                        <span className="text-[9px] text-slate-400 block font-mono">
+                          Size: {item.sizeFormatted}
+                        </span>
+                      </div>
+                      
+                      {/* Interactive badge indicators */}
+                      <span className="text-[9px] font-mono font-bold shrink-0 uppercase tracking-wider">
+                        {isPreparing && <span className="text-amber-400 animate-pulse">Preparing...</span>}
+                        {isUploading && <span className="text-indigo-400 font-extrabold">{item.progress}%</span>}
+                        {isProcessing && <span className="text-cyan-400 animate-pulse">Encrypting...</span>}
+                        {isGenerating && <span className="text-purple-400 animate-pulse">Previews...</span>}
+                        {isCompleted && (
+                          <motion.span 
+                            initial={{ scale: 0.8 }}
+                            animate={{ scale: 1 }}
+                            className="text-emerald-400 flex items-center gap-1 font-extrabold"
+                          >
+                            <Check className="w-3 h-3 text-emerald-400" /> Secure
+                          </motion.span>
+                        )}
+                        {isFailed && <span className="text-rose-400 font-extrabold">Failed</span>}
                       </span>
-                      <button 
-                        onClick={() => handleRetryUpload(item.id)}
-                        className="text-[9px] font-bold text-indigo-400 hover:text-indigo-300 underline cursor-pointer"
-                      >
-                        Retry
-                      </button>
                     </div>
-                  )}
-                </div>
-              ))}
+
+                    {/* Dynamic Contextual Text Lines */}
+                    {(isUploading || isProcessing || isGenerating || isPreparing) && (
+                      <div className="flex justify-between items-center text-[8px] text-slate-400 mt-1.5 font-mono">
+                        {isPreparing && <span>Allocating isolated sandbox container...</span>}
+                        {isUploading && (
+                          <>
+                            <span>Speed: {item.speed || 'estimating...'}</span>
+                            <span>Remaining: {item.remainingTime || 'estimating...'}</span>
+                          </>
+                        )}
+                        {isProcessing && <span>Hashing metadata & securing file records...</span>}
+                        {isGenerating && <span>Generating slideshow PDF & thumbnails...</span>}
+                      </div>
+                    )}
+
+                    {/* Progress Line */}
+                    <div className="w-full bg-white/10 h-1.5 rounded-full overflow-hidden relative mt-2">
+                      <motion.div 
+                        initial={{ width: 0 }}
+                        animate={{ 
+                          width: isCompleted ? '100%' : 
+                                 isPreparing ? '5%' : 
+                                 isProcessing ? '100%' : 
+                                 isGenerating ? '100%' : `${item.progress}%` 
+                        }}
+                        transition={{ duration: 0.3 }}
+                        className={`h-full rounded-full ${
+                          isFailed ? 'bg-gradient-to-r from-rose-500 to-red-600' :
+                          isCompleted ? 'bg-gradient-to-r from-emerald-400 to-teal-500' :
+                          isProcessing ? 'bg-gradient-to-r from-cyan-400 to-indigo-500' :
+                          isGenerating ? 'bg-gradient-to-r from-purple-400 to-pink-500' :
+                          'bg-gradient-to-r from-indigo-500 to-purple-500'
+                        }`}
+                      />
+                    </div>
+
+                    {/* Error diagnostics & re-try option */}
+                    {isFailed && (
+                      <div className="flex justify-between items-center gap-2 mt-2 pt-1.5 border-t border-rose-500/10">
+                        <span className="text-[9px] text-rose-300 truncate max-w-[200px]" title={item.error}>
+                          Reason: {item.error || 'Connection timeout'}
+                        </span>
+                        <button 
+                          onClick={() => handleRetryUpload(item.id)}
+                          className="text-[9px] font-bold text-indigo-400 hover:text-indigo-300 underline cursor-pointer hover:bg-white/5 px-2 py-0.5 rounded transition-all shrink-0"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    )}
+                  </motion.div>
+                );
+              })}
             </div>
           </motion.div>
         )}

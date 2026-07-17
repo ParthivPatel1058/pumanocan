@@ -19,7 +19,14 @@ export const getSupabaseConfig = (): SupabaseConfig => {
   const metaEnv = (import.meta as any).env || {};
   const url = localStorage.getItem(SUPABASE_URL_KEY) || metaEnv.VITE_SUPABASE_URL || '';
   const anonKey = localStorage.getItem(SUPABASE_ANON_KEY) || metaEnv.VITE_SUPABASE_ANON_KEY || '';
-  const enabled = localStorage.getItem(SUPABASE_ENABLED_KEY) === 'true';
+  
+  // If environment variables are defined, default enabled to true if not explicitly set in localStorage
+  const hasLocalEnabled = localStorage.getItem(SUPABASE_ENABLED_KEY);
+  const defaultEnabled = (metaEnv.VITE_SUPABASE_URL && metaEnv.VITE_SUPABASE_ANON_KEY) ? true : false;
+  const enabled = hasLocalEnabled !== null 
+    ? hasLocalEnabled === 'true' 
+    : defaultEnabled;
+    
   return { url, anonKey, enabled };
 };
 
@@ -360,5 +367,24 @@ CREATE POLICY "Allow owner-only upsert on profiles" ON public.profiles FOR ALL U
 CREATE POLICY "Allow owner-only folders access" ON public.folders FOR ALL USING (owner_id = owner_id);
 CREATE POLICY "Allow owner-only files access" ON public.files FOR ALL USING (owner_id = owner_id);
 CREATE POLICY "Allow owner-only activities access" ON public.activities FOR ALL USING (owner_id = owner_id);
+
+-- 5. STORAGE BUCKET Setup
+-- Note: Run these SQL statements in your Supabase SQL Editor to prepare the 'pumanocan-vault' storage bucket
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES ('pumanocan-vault', 'pumanocan-vault', true, 104857600, NULL)
+ON CONFLICT (id) DO NOTHING;
+
+-- Enable storage RLS policies for public file uploads/downloads
+CREATE POLICY "Allow public select access on vault storage" ON storage.objects
+  FOR SELECT USING (bucket_id = 'pumanocan-vault');
+
+CREATE POLICY "Allow public upload access on vault storage" ON storage.objects
+  FOR INSERT WITH CHECK (bucket_id = 'pumanocan-vault');
+
+CREATE POLICY "Allow public update access on vault storage" ON storage.objects
+  FOR UPDATE USING (bucket_id = 'pumanocan-vault');
+
+CREATE POLICY "Allow public delete access on vault storage" ON storage.objects
+  FOR DELETE USING (bucket_id = 'pumanocan-vault');
 `;
 };

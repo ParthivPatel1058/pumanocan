@@ -5,7 +5,8 @@ import {
   signInWithPopup, 
   signOut as firebaseSignOut,
   onAuthStateChanged,
-  User
+  User,
+  signInWithCredential
 } from 'firebase/auth';
 import { 
   getFirestore, 
@@ -40,17 +41,63 @@ let cachedAccessToken: string | null = null;
 let isSigningIn = false;
 
 /**
- * Handle Google authentication popup flow
+ * Handle Google authentication popup flow using direct OAuth implicit flow
+ * and Firebase credential sign-in to bypass unauthorized-domain issues.
  */
 export const googleSignIn = async (): Promise<{ user: User; accessToken: string | null } | null> => {
   try {
     isSigningIn = true;
-    const result = await signInWithPopup(auth, googleProvider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    const accessToken = credential?.accessToken || null;
+
+    const clientId = (firebaseConfig as any).oAuthClientId || "885440242777-cqqa0h84nkqu1agesmmbl4dt3uueapb5.apps.googleusercontent.com";
+    const redirectUri = window.location.origin;
+    const scopes = [
+      'openid',
+      'email',
+      'profile',
+      'https://www.googleapis.com/auth/drive.readonly',
+      'https://www.googleapis.com/auth/presentations.readonly'
+    ].join(' ');
+
+    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` + 
+      `client_id=${encodeURIComponent(clientId)}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&response_type=token` +
+      `&scope=${encodeURIComponent(scopes)}` +
+      `&prompt=select_account`;
+
+    const token = await new Promise<string>((resolve, reject) => {
+      const popup = window.open(authUrl, 'google_oauth_popup', 'width=600,height=700');
+      if (!popup) {
+        reject(new Error('Popup blocked. Please allow popups for this site to connect Google Workspace.'));
+        return;
+      }
+
+      // Check if popup was closed by user
+      const checkClosed = setInterval(() => {
+        if (popup.closed) {
+          clearInterval(checkClosed);
+          reject(new Error('Sign-in popup was closed before completing authorization.'));
+        }
+      }, 1000);
+
+      const messageListener = (event: MessageEvent) => {
+        if (event.origin !== window.location.origin) return;
+        if (event.data?.type === 'GOOGLE_OAUTH_TOKEN_SUCCESS' && event.data?.token) {
+          clearInterval(checkClosed);
+          window.removeEventListener('message', messageListener);
+          resolve(event.data.token);
+        }
+      };
+
+      window.addEventListener('message', messageListener);
+    });
+
+    // Authenticate with Firebase Auth using the Google access token
+    const credential = GoogleAuthProvider.credential(null, token);
+    const result = await signInWithCredential(auth, credential);
     
-    cachedAccessToken = accessToken;
-    return { user: result.user, accessToken };
+    cachedAccessToken = token;
+    return { user: result.user, accessToken: token };
   } catch (error: any) {
     console.error('Firebase Google Sign-In Error:', error);
     throw error;
